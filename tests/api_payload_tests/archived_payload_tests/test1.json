@@ -1,0 +1,123 @@
+{
+  "user_id": "U-1001",
+
+  "student_profile": {
+    "personal_info": {
+      "name": "Dr. Natthaporn Takpho",
+      "email": "natthaporn.takpho@example.com",
+      "phone": "+66-81-234-5678",
+      "linkedin": "https://www.linkedin.com/in/natthaporntakpho/"
+    },
+
+    "education": [
+      {
+        "id": "edu#phd_naist",
+        "degree": "PhD in Biological Science",
+        "institution": "Nara Institute of Science and Technology (NAIST)",
+        "field_of_study": "Biological Science",
+        "start_date": "2011-04-01",
+        "end_date": "2016-03-31",
+        "graduation_date": "2016-03-31"
+      },
+      {
+        "id": "edu#bsc_mahidol",
+        "degree": "BSc in Biochemistry",
+        "institution": "Mahidol University",
+        "field_of_study": "Biochemistry",
+        "start_date": "2007-06-01",
+        "end_date": "2011-03-31",
+        "graduation_date": "2011-03-31"
+      }
+    ],
+
+    "experience": [
+      {
+        "id": "work_exp#mojia",
+        "title": "Associate Director, Synthetic Biology Research",
+        "company": "Mojia Biotech Pte. Ltd.",
+        "start_date": "2023-04-01",
+        "end_date": "2024-06-30",
+        "responsibilities": [
+          "Led enzyme screening and pathway optimization projects for PDO production",
+          "Secured government research grants and established cross-border collaborations"
+        ]
+      },
+      {
+        "id": "work_exp#mitsui_sg",
+        "title": "Assistant Manager, Research Division",
+        "company": "Mitsui Chemicals Singapore R&D Centre",
+        "start_date": "2017-11-01",
+        "end_date": "2023-03-31",
+        "responsibilities": [
+          "Managed R&D projects and IP strategy for biotechnology applications",
+          "Awarded 'Most Passionate Idea Award 2021' for healthcare innovation"
+        ]
+      }
+    ],
+
+    "skills": [
+      {
+        "id": "skill#molecular_biology",
+        "name": "Molecular Biology",
+        "description": "Expertise in molecular biology techniques and workflows.",
+        "level": "L4_Expert"
+      },
+      {
+        "id": "skill#analytical_thinking",
+        "name": "Analytical Thinking",
+        "description": "Ability to analyze data and derive insights.",
+        "level": "L3_Advanced"
+      },
+      {
+        "id": "skill#market_analysis",
+        "name": "Market Analysis",
+        "description": "Understand market dynamics and competitive landscape.",
+        "level": "L3_Advanced"
+      },
+      {
+        "id": "skill#strategic_planning",
+        "name": "Strategic Planning",
+        "description": "Capable of developing long-term strategic plans.",
+        "level": "L3_Advanced"
+      }
+    ],
+
+    "awards": [],
+    "extracurriculars": []
+  },
+
+  "target_role_taxonomy": {
+    "role_id": "JR-BIO-RND",
+    "role_title": "Biotechnology R&D Scientist",
+    "role_description": "A biotechnology R&D Scientist is responsible for developing, optimizing, and scaling up biological production systems.",
+    "role_required_skills": [
+      "Molecular biology",
+      "Synthetic biology",
+      "Bioprocess optimization",
+      "Project management",
+      "Metabolic engineering",
+      "Fermentation optimization",
+      "Pathway design",
+      "Tech transfer strategy"
+    ]
+  },
+
+  "target_jd_taxonomy": {
+    "job_title": "R&D Manager, Biotechnology",
+    "job_required_skills": [
+      "Metabolic engineering",
+      "Project management",
+      "Communication skills",
+      "English and Japanese"
+    ]
+  },
+
+  "template_id": "T_EMPLOYER_STD_V3",
+  "sections": [
+    "profile_summary",
+    "skills",
+    "education",
+    "experience"
+  ],
+  "language": "en"
+}

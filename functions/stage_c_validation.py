@@ -1,0 +1,924 @@
+from __future__ import annotations
+
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from types import SimpleNamespace
+
+import re
+
+import structlog
+
+from schemas.output_schema import CVGenerationResponse, SectionContent, OutputSkillItem
+from functions.utils.llm_client import load_parameters
+
+logger = structlog.get_logger(__name__).bind(module="stage_c_validation")
+
+
+class StageCValidationError(Exception):
+    """Fatal validation error for Stage C validation."""
+
+
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+
+def _load_validation_params() -> Dict[str, Any]:
+    """
+    Load validation-related config from parameters.yaml via load_parameters().
+
+    Expected structure in parameters.yaml (optional):
+
+    validation:
+      min_skills_required: 3
+      min_education_required: 1
+      require_email: true
+      require_name: true
+      max_section_chars_default: 1500
+      drop_empty_sections: true
+      enable_safety_cleaning: true
+      max_skills: 50
+      strict_mode: false
+
+    security:
+      critical_patterns: [...]
+      suspicious_patterns: [...]
+    """
+    params = load_parameters() or {}
+
+    cfg = params.get("validation") or {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    # Defaults for validation behaviour
+    cfg.setdefault("min_skills_required", 0)
+    cfg.setdefault("min_education_required", 0)
+    cfg.setdefault("require_email", False)
+    cfg.setdefault("require_name", False)
+    cfg.setdefault("max_section_chars_default", 1500)
+    cfg.setdefault("drop_empty_sections", True)
+    cfg.setdefault("enable_safety_cleaning", True)
+    cfg.setdefault("max_skills", 50)
+    cfg.setdefault("strict_mode", False)
+
+    # Attach security config (if present) so Stage C can use it as a backstop
+    security_cfg = params.get("security") or {}
+    if isinstance(security_cfg, dict):
+        cfg.setdefault("_security_cfg", security_cfg)
+
+    return cfg
+
+
+def _fallback_skills_from_request(original_request: Any) -> List[OutputSkillItem]:
+    """
+    Last-resort fallback: reconstruct skills list from the original request
+    if Stage B returned zero skills.
+
+    Supports both:
+    - Legacy shape: original_request.profile_info["skills"]
+    - New API shape: original_request.student_profile.skills
+    """
+    skills_out: List[OutputSkillItem] = []
+
+    # 1) Legacy profile_info dict
+    profile_info = getattr(original_request, "profile_info", None)
+    if isinstance(profile_info, dict):
+        raw_skills = profile_info.get("skills") or []
+        if isinstance(raw_skills, list):
+            for item in raw_skills:
+                if isinstance(item, dict):
+                    name = item.get("name")
+                    level = item.get("level")
+                else:
+                    name = str(item)
+                    level = None
+                if not name:
+                    continue
+                skills_out.append(
+                    OutputSkillItem(
+                        name=name[:100],
+                        level=str(level) if level is not None else None,
+                        source="profile_info",
+                    )
+                )
+
+    # 2) New API shape: student_profile.skills
+    student_profile = getattr(original_request, "student_profile", None)
+    if student_profile is not None:
+        raw_sp_skills = getattr(student_profile, "skills", []) or []
+        for sp_skill in raw_sp_skills:
+            name = getattr(sp_skill, "name", None)
+            if not name:
+                continue
+            level = getattr(sp_skill, "level", None)
+            # Enum → value
+            if hasattr(level, "value"):
+                level = level.value
+            skills_out.append(
+                OutputSkillItem(
+                    name=str(name)[:100],
+                    level=str(level) if level is not None else None,
+                    source="student_profile",
+                )
+            )
+
+    # Deduplicate by name (case-insensitive)
+    deduped: List[OutputSkillItem] = []
+    seen: set[str] = set()
+    for sk in skills_out:
+        key = (sk.name or "").strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(sk)
+
+    return deduped
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def run_stage_c_validation(
+    response: CVGenerationResponse,
+    *,
+    template_info: Dict[str, Any] | Any | None = None,
+    original_request: Any | None = None,
+) -> CVGenerationResponse:
+    """
+    Stage C: post-LLM validation & sanitization.
+
+    - Enforces section set & order according to template_info
+    - Cleans each section's text (whitespace, length, simple artifacts)
+    - Performs light prompt-injection backstop using security patterns
+    - Normalizes and deduplicates skills
+    - Runs global consistency checks:
+        * name/email present (optional)
+        * min skills / education thresholds
+        * cross-checks vs original_request (template_id, job_id, language)
+    - Optionally enforces strict_mode via StageCValidationError
+
+    Returns a CVGenerationResponse that should still dump to the same
+    JSON format as Stage B output (e.g. tests/generated_test_cvs/output_w_llm.json).
+    """
+    cfg = _load_validation_params()
+    strict_mode = bool(cfg.get("strict_mode", False))
+
+    # 1) Sanity-check / ensure we have a CVGenerationResponse instance
+    resp = _ensure_cv_response(response)
+
+    # 2) Resolve + normalize template_info (supports legacy + new request shapes)
+    resolved_template_info = _resolve_template_info(
+        explicit_template_info=template_info,
+        original_request=original_request,
+    )
+    tmpl_dict = _normalize_template_info(resolved_template_info)
+    allowed_sections = _compute_allowed_sections(tmpl_dict)
+
+    # 3) Sanitize sections (drop unknown, enforce order, truncate & clean text)
+    sections = getattr(resp, "sections", None) or {}
+    cleaned_sections = _sanitize_sections(
+        sections=sections,
+        allowed_sections=allowed_sections,
+        template_info=tmpl_dict,
+        cfg=cfg,
+        resp=resp,
+    )
+    resp.sections = cleaned_sections
+
+    # 4) Sanitize skills (normalize + dedup + cap)
+    skills = getattr(resp, "skills", None)
+    resp.skills = _sanitize_skills(skills, cfg, resp)
+
+    # 5) Normalize metadata (best-effort, non-breaking)
+    _normalize_metadata(resp)
+
+    # 6) Global consistency checks (name/email, min skills/education, cross-checks)
+    _run_global_consistency_checks(
+        resp=resp,
+        template_info=tmpl_dict,
+        cfg=cfg,
+        original_request=original_request,
+    )
+
+    # 7) Strict mode: if we ended with no sections at all, consider this fatal
+    if strict_mode and not resp.sections:
+        msg = "Stage C removed all sections; failing in strict_mode."
+        logger.error("stage_c_all_sections_removed_strict", message=msg)
+        raise StageCValidationError(msg)
+
+    logger.info(
+        "stage_c_validation_completed",
+        num_sections=len(resp.sections or {}),
+        num_skills=len(resp.skills or []) if getattr(resp, "skills", None) else 0,
+    )
+
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers: response / template handling
+# ---------------------------------------------------------------------------
+
+
+def _ensure_cv_response(response: Any) -> CVGenerationResponse:
+    """
+    Ensure we are working with a CVGenerationResponse instance.
+
+    We expect Stage B to already return this type; if not, we attempt a
+    best-effort coercion via model_construct / from_orm / direct init.
+    """
+    if isinstance(response, CVGenerationResponse):
+        return response
+
+    # Try Pydantic v2-style model_construct
+    if hasattr(CVGenerationResponse, "model_construct"):
+        logger.warning("stage_c_coercing_response_via_model_construct")
+        return CVGenerationResponse.model_construct(**dict(response))  # type: ignore[arg-type]
+
+    # Fallback: assume dict-like and pass to constructor
+    try:
+        logger.warning("stage_c_coercing_response_via_init")
+        return CVGenerationResponse(**dict(response))  # type: ignore[arg-type]
+    except Exception as exc:  # pragma: no cover - hard failure path
+        logger.error("stage_c_response_coercion_failed", error=str(exc))
+        raise StageCValidationError("Cannot coerce Stage B output into CVGenerationResponse") from exc
+
+
+def _resolve_template_info(
+    *,
+    explicit_template_info: Any | None,
+    original_request: Any | None,
+) -> Any | None:
+    """
+    Resolve template_info in a way that supports both legacy and new request shapes.
+
+    Priority:
+    1) If explicit_template_info is passed to Stage C, use it as-is.
+    2) Else, if original_request has .template_info (legacy shape), use that.
+    3) Else, if original_request looks like the new CVGenerationRequest shape,
+       synthesize a SimpleNamespace(template_id, sections, language, max_chars_per_section).
+
+    If nothing is resolvable, return None and Stage C will behave with an empty template.
+    """
+    # 1) Explicit override wins
+    if explicit_template_info is not None:
+        return explicit_template_info
+
+    # 2) Legacy shape: request.template_info
+    if original_request is not None and hasattr(original_request, "template_info"):
+        try:
+            return getattr(original_request, "template_info")
+        except AttributeError:
+            # Very defensive; should not normally happen
+            pass
+
+    # 3) New shape (CVGenerationRequest) – synthesize from top-level fields
+    if original_request is not None:
+        template_id = getattr(original_request, "template_id", None)
+        sections = getattr(original_request, "sections", None)
+        language = getattr(original_request, "language", None)
+        max_chars_per_section = getattr(original_request, "max_chars_per_section", None)
+
+        # If we don't even have template_id or sections, nothing useful to synthesize
+        if template_id is not None or sections:
+            # If language is an Enum (e.g. LanguageEnum), prefer its .value
+            lang_value = getattr(language, "value", language)
+            return SimpleNamespace(
+                template_id=template_id,
+                sections=sections,
+                language=lang_value,
+                max_chars_per_section=max_chars_per_section,
+            )
+
+    # 4) Nothing to resolve
+    return None
+
+
+def _normalize_template_info(template_info: Any | None) -> Dict[str, Any]:
+    """
+    Normalize template_info to a plain dict for ease of use.
+
+    Accepts:
+    - dict
+    - Pydantic models with model_dump() / dict()
+    - arbitrary objects with attributes
+    """
+    if template_info is None:
+        return {}
+
+    if isinstance(template_info, dict):
+        return template_info
+
+    # Pydantic v2
+    if hasattr(template_info, "model_dump"):
+        try:
+            return template_info.model_dump()
+        except Exception:
+            pass
+
+    # Pydantic v1
+    if hasattr(template_info, "dict"):
+        try:
+            return template_info.dict()
+        except Exception:
+            pass
+
+    # Fallback: shallow attribute extraction
+    result: Dict[str, Any] = {}
+    for key in ("template_id", "sections_order", "sections", "max_chars_per_section", "language"):
+        if hasattr(template_info, key):
+            result[key] = getattr(template_info, key)
+    return result
+
+
+def _compute_allowed_sections(template_info: Dict[str, Any]) -> List[str]:
+    """
+    Determine allowed section IDs, following the same rule as the
+    test helper _compute_sections_from_template_and_user:
+
+    - Use ONLY the order defined in template_info["sections_order"]
+      (or fallback to template_info["sections"]).
+    - Do NOT append extra user-only sections here.
+    """
+    result: List[str] = []
+    seen: set[str] = set()
+
+    raw_order = (
+        template_info.get("sections_order")
+        or template_info.get("sections")
+        or []
+    )
+
+    if isinstance(raw_order, list):
+        for item in raw_order:
+            section_id: Optional[str]
+            if isinstance(item, str):
+                section_id = item
+            elif isinstance(item, dict):
+                section_id = item.get("id")
+            else:
+                section_id = None
+
+            if not section_id:
+                continue
+
+            if section_id not in seen:
+                seen.add(section_id)
+                result.append(section_id)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers: section sanitization
+# ---------------------------------------------------------------------------
+
+
+def _matches_any_pattern(text: str, patterns: Iterable[str]) -> bool:
+    """Return True if `text` matches any regex pattern (case-insensitive)."""
+    for pattern in patterns:
+        try:
+            if re.search(pattern, text, flags=re.IGNORECASE):
+                return True
+        except re.error:
+            # Ignore invalid regex patterns
+            continue
+    return False
+
+
+def _sanitize_sections(
+    *,
+    sections: Dict[str, Any],
+    allowed_sections: List[str],
+    template_info: Dict[str, Any],
+    cfg: Dict[str, Any],
+    resp: CVGenerationResponse,
+) -> Dict[str, SectionContent]:
+    """
+    - Keep only sections that are allowed by template_info (for ordering),
+      but NEVER silently drop sections that Stage B already generated.
+    - Enforce deterministic ordering
+    - Run light injection backstop using security patterns
+    - Clean & truncate text according to template + validation config
+    """
+    cleaned: Dict[str, SectionContent] = {}
+
+    # Pre-compute per-section max length
+    per_section_limits: Dict[str, int] = {}
+    tmpl_limits = template_info.get("max_chars_per_section") or {}
+    if isinstance(tmpl_limits, dict):
+        for k, v in tmpl_limits.items():
+            try:
+                per_section_limits[str(k)] = int(v)
+            except Exception:
+                continue
+
+    default_max = int(cfg.get("max_section_chars_default", 1500))
+    drop_empty = bool(cfg.get("drop_empty_sections", True))
+    enable_cleaning = bool(cfg.get("enable_safety_cleaning", True))
+    strict_mode = bool(cfg.get("strict_mode", False))
+
+    # Optional security backstop
+    security_cfg = cfg.get("_security_cfg") or {}
+    if not isinstance(security_cfg, dict):
+        security_cfg = {}
+    critical_patterns = security_cfg.get("critical_patterns") or []
+    suspicious_patterns = security_cfg.get("suspicious_patterns") or []
+
+    # 🔹 NEW: decide which section IDs to process
+    # - If allowed_sections is non-empty, use it for ordering but
+    #   also append any extra sections present in `sections`.
+    # - If allowed_sections is empty, just use the keys from `sections`.
+    if allowed_sections:
+        section_ids: List[str] = [sid for sid in allowed_sections if sid in sections]
+        # Append any Stage B–generated sections not listed in the template,
+        # so we never drop them silently.
+        for sid in sections.keys():
+            if sid not in section_ids:
+                section_ids.append(sid)
+    else:
+        section_ids = list(sections.keys())
+
+    for section_id in section_ids:
+        if section_id not in sections:
+            continue
+
+        raw_val = sections[section_id]
+        sec_obj = _ensure_section_content(raw_val)
+
+        text = getattr(sec_obj, "text", "")
+        if not isinstance(text, str):
+            text = str(text)
+
+        orig_text = text
+
+        # 🔍 Injection backstop BEFORE further cleaning
+        if text and critical_patterns:
+            if _matches_any_pattern(text, critical_patterns):
+                msg = (
+                    f"Critical injection pattern detected in section '{section_id}'. "
+                    "Section removed by Stage C."
+                )
+                _append_metadata_warning(resp, msg)
+                logger.warning("stage_c_section_dropped_injection", section_id=section_id)
+                if strict_mode:
+                    raise StageCValidationError(msg)
+                # Drop this section in non-strict mode
+                continue
+
+        if text and suspicious_patterns:
+            if _matches_any_pattern(text, suspicious_patterns):
+                msg = f"Suspicious pattern detected in section '{section_id}'. Content kept but flagged."
+                _append_metadata_warning(resp, msg)
+                logger.warning("stage_c_section_suspicious", section_id=section_id)
+
+        # Basic cleaning
+        text = _clean_text(text, enable_cleaning)
+
+        # Only drop sections that are TRULY empty after cleaning
+        if not text.strip() and drop_empty:
+            _append_metadata_warning(
+                resp,
+                f"Section '{section_id}' removed as empty after cleaning.",
+            )
+            logger.info("stage_c_section_dropped_empty", section_id=section_id)
+            continue
+
+        # Length limit
+        max_len = per_section_limits.get(section_id, default_max)
+        if max_len > 0 and len(text) > max_len:
+            truncated_text = text[:max_len].rstrip()
+            _append_metadata_warning(
+                resp,
+                f"Section '{section_id}' truncated from {len(text)} to {len(truncated_text)} characters.",
+            )
+            logger.info(
+                "stage_c_section_truncated",
+                section_id=section_id,
+                old_len=len(text),
+                new_len=len(truncated_text),
+                max_len=max_len,
+            )
+            text = truncated_text
+
+        if text != orig_text:
+            # Update section object
+            sec_obj.text = text
+
+        cleaned[section_id] = sec_obj
+
+    return cleaned
+
+
+_SECTION_MULTI_BLANK_RE = re.compile(r"\n{3,}")
+
+
+def _clean_text(text: str, enable_cleaning: bool) -> str:
+    """
+    Basic, conservative text cleanup:
+    - Normalize newlines
+    - Strip outer whitespace
+    - Collapse 3+ blank lines → 2
+    - Remove stray markdown code fences (```), but keep their content
+    """
+    if not enable_cleaning:
+        return text
+
+    if not text:
+        return ""
+
+    # Normalize line endings
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Remove markdown code fence markers but keep content
+    text = text.replace("```", "")
+
+    # Collapse multiple blank lines
+    text = _SECTION_MULTI_BLANK_RE.sub("\n\n", text)
+
+    # Strip leading/trailing whitespace & quotes artifacts
+    text = text.strip(" \t\n\r\"'")
+
+    return text
+
+
+def _ensure_section_content(value: Any) -> SectionContent:
+    """
+    Ensure a value is a SectionContent.
+
+    Accepts:
+    - SectionContent instances
+    - dicts with "text"
+    - arbitrary values (converted to str)
+    """
+    if isinstance(value, SectionContent):
+        return value
+
+    if isinstance(value, dict):
+        base_text = value.get("text", "")
+    else:
+        base_text = value
+
+    if not isinstance(base_text, str):
+        base_text = str(base_text)
+
+    # Prefer Pydantic v2-style model_construct
+    if hasattr(SectionContent, "model_construct"):
+        return SectionContent.model_construct(text=base_text)  # type: ignore[call-arg]
+
+    # Fallback to classic init
+    try:
+        return SectionContent(text=base_text)  # type: ignore[call-arg]
+    except Exception:
+        # Last resort: create instance without __init__ and set .text
+        obj = SectionContent.__new__(SectionContent)  # type: ignore[call-arg]
+        setattr(obj, "text", base_text)
+        return obj  # type: ignore[return-value]
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers: skills sanitization
+# ---------------------------------------------------------------------------
+
+
+def _sanitize_skills(
+    skills: Any,
+    cfg: Dict[str, Any],
+    resp: CVGenerationResponse,
+) -> Optional[List[OutputSkillItem]]:
+    """
+    Normalize and deduplicate skills.
+
+    - Ensures each item has a non-empty .name
+    - Strips whitespace from name
+    - Deduplicates by (name_lower, level_normalized)
+    - Caps list size via cfg["max_skills"]
+    """
+    if not skills:
+        return None
+
+    max_skills = int(cfg.get("max_skills", 50))
+    cleaned: List[OutputSkillItem] = []
+    seen: set[Tuple[str, str]] = set()
+
+    def _mk_item(name: str, level: Any, source: Any) -> OutputSkillItem:
+        if hasattr(OutputSkillItem, "model_construct"):
+            return OutputSkillItem.model_construct(  # type: ignore[call-arg]
+                name=name,
+                level=level,
+                source=source,
+            )
+        return OutputSkillItem(name=name, level=level, source=source)  # type: ignore[call-arg]
+
+    for idx, item in enumerate(skills):
+        name: Optional[str] = None
+        level: Any = None
+        source: Any = None
+
+        if isinstance(item, OutputSkillItem):
+            name = getattr(item, "name", None)
+            level = getattr(item, "level", None)
+            source = getattr(item, "source", None)
+        elif isinstance(item, dict):
+            name = item.get("name")
+            level = item.get("level")
+            source = item.get("source")
+        else:
+            # fallback: treat as a raw name
+            name = str(item)
+
+        if not name:
+            continue
+
+        name_clean = str(name).strip()
+        if not name_clean:
+            continue
+
+        level_norm = "" if level is None else str(level).strip()
+        dedup_key = (name_clean.lower(), level_norm.lower())
+
+        if dedup_key in seen:
+            continue
+
+        seen.add(dedup_key)
+
+        if isinstance(item, OutputSkillItem):
+            # Reuse existing instance but normalize name
+            try:
+                item.name = name_clean  # type: ignore[attr-defined]
+                cleaned.append(item)
+            except Exception:
+                cleaned.append(_mk_item(name_clean, level, source or "stage_b"))
+        else:
+            cleaned.append(_mk_item(name_clean, level, source or "stage_b"))
+
+        if len(cleaned) >= max_skills:
+            _append_metadata_warning(
+                resp,
+                f"Skills list truncated to max_skills={max_skills}.",
+            )
+            logger.info(
+                "stage_c_skills_truncated",
+                max_skills=max_skills,
+                original_count=len(skills),
+            )
+            break
+
+    return cleaned or None
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers: metadata & global checks
+# ---------------------------------------------------------------------------
+
+
+def _normalize_metadata(resp: CVGenerationResponse) -> None:
+    """
+    Best-effort metadata normalization.
+
+    - Optionally mark validation as passed
+    - Accumulate warnings list (already handled in _append_metadata_warning)
+    """
+    meta = getattr(resp, "metadata", None)
+    if meta is None:
+        return
+
+    # Attach a simple "stage_c_validated" flag if possible
+    try:
+        setattr(meta, "stage_c_validated", True)
+    except Exception:
+        # non-fatal
+        pass
+
+
+def _append_metadata_warning(resp: CVGenerationResponse, message: str) -> None:
+    """
+    Attach a warning string to resp.metadata.validation_warnings if possible.
+    """
+    meta = getattr(resp, "metadata", None)
+    if meta is None:
+        return
+
+    try:
+        existing = getattr(meta, "validation_warnings", None)
+        if not isinstance(existing, list):
+            existing = []
+        existing.append(message)
+        setattr(meta, "validation_warnings", existing)
+    except Exception:
+        # metadata might be a plain object / stub; ignore failures
+        pass
+
+
+def _get_meta_field(meta: Any, field_name: str) -> Any:
+    """
+    Helper to retrieve fields like name/email from metadata.
+
+    Tries:
+    - meta.<field_name>
+    - meta.profile_info[field_name] if profile_info is a dict
+    """
+    if meta is None:
+        return None
+
+    if hasattr(meta, field_name):
+        value = getattr(meta, field_name)
+        if value:
+            return value
+
+    profile_info = getattr(meta, "profile_info", None)
+    if isinstance(profile_info, dict):
+        return profile_info.get(field_name)
+
+    return None
+
+
+def _run_global_consistency_checks(
+    *,
+    resp: CVGenerationResponse,
+    template_info: Dict[str, Any],
+    cfg: Dict[str, Any],
+    original_request: Any | None,
+) -> None:
+    """
+    Global consistency checks that can emit warnings or raise StageCValidationError
+    depending on strict_mode.
+
+    - require_name / require_email
+    - min_skills_required / min_education_required
+    - cross-check template_id, job_id, language vs original_request
+    """
+    strict_mode = bool(cfg.get("strict_mode", False))
+    meta = getattr(resp, "metadata", None)
+
+    # --- Required metadata fields (name/email) ---
+    missing_fields: List[str] = []
+    if cfg.get("require_name"):
+        name = _get_meta_field(meta, "name")
+        if not name or not str(name).strip():
+            missing_fields.append("name")
+
+    if cfg.get("require_email"):
+        email = _get_meta_field(meta, "email")
+        if not email or not str(email).strip():
+            missing_fields.append("email")
+
+    if missing_fields:
+        msg = f"Missing required metadata fields: {', '.join(missing_fields)}."
+        _append_metadata_warning(resp, msg)
+        logger.warning("stage_c_missing_required_metadata", missing_fields=missing_fields)
+        if strict_mode:
+            raise StageCValidationError(msg)
+
+    # --- Minimum skills / education checks ---
+    min_skills_required = int(cfg.get("min_skills_required", 0))
+    min_education_required = int(cfg.get("min_education_required", 0))
+
+    # Current skills list
+    skills_list: List[OutputSkillItem] = list(resp.skills or []) if getattr(resp, "skills", None) else []
+    num_skills = len(skills_list)
+
+    if min_skills_required > 0 and num_skills < min_skills_required:
+        # 🔹 NEW: try to recover skills from the original request
+        if original_request is not None:
+            fallback_skills = _fallback_skills_from_request(original_request)
+            if fallback_skills:
+                existing_lower = {s.name.lower() for s in skills_list if getattr(s, "name", None)}
+                for sk in fallback_skills:
+                    if sk.name and sk.name.lower() not in existing_lower:
+                        skills_list.append(sk)
+                        existing_lower.add(sk.name.lower())
+
+                resp.skills = skills_list
+                num_skills = len(skills_list)
+
+                logger.info(
+                    "stage_c_filled_skills_from_request",
+                    num_skills=num_skills,
+                    min_skills_required=min_skills_required,
+                )
+
+        # Re-check after fallback
+        if num_skills < min_skills_required:
+            msg = (
+                f"Only {num_skills} skills present; "
+                f"min_skills_required={min_skills_required}."
+            )
+            _append_metadata_warning(resp, msg)
+            logger.warning(
+                "stage_c_insufficient_skills",
+                min_skills_required=min_skills_required,
+                num_skills=num_skills,
+            )
+            if strict_mode:
+                raise StageCValidationError(msg)
+
+    if min_education_required > 0:
+        has_education_section = "education" in (resp.sections or {})
+        if not has_education_section:
+            msg = (
+                f"No 'education' section present but "
+                f"min_education_required={min_education_required}."
+            )
+            _append_metadata_warning(resp, msg)
+            logger.warning(
+                "stage_c_missing_education_section",
+                min_education_required=min_education_required,
+            )
+            if strict_mode:
+                raise StageCValidationError(msg)
+
+    # --- Cross-checks vs original_request (template_id, job_id, language) ---
+    if original_request is not None:
+        _cross_check_response_vs_request(resp, original_request, strict_mode)
+
+
+def _cross_check_response_vs_request(
+    resp: CVGenerationResponse,
+    original_request: Any,
+    strict_mode: bool,
+) -> None:
+    """
+    Cross-check response metadata against the original request.
+
+    - template_id consistency
+    - job_id consistency (if both sides have it)
+    - language consistency
+    """
+    # template_id
+    req_template_id = None
+
+    # Legacy shape: nested template_info
+    if hasattr(original_request, "template_info"):
+        tmpl = getattr(original_request, "template_info")
+        if tmpl is not None:
+            if isinstance(tmpl, dict):
+                req_template_id = tmpl.get("template_id")
+            elif hasattr(tmpl, "template_id"):
+                req_template_id = getattr(tmpl, "template_id")
+
+    # New shape: top-level template_id on the request
+    if req_template_id is None:
+        req_template_id = getattr(original_request, "template_id", None)
+
+    resp_template_id = getattr(resp, "template_id", None)
+
+    if req_template_id and not resp_template_id:
+        # Fill in missing template_id in response
+        try:
+            setattr(resp, "template_id", req_template_id)
+        except Exception:
+            pass
+    elif req_template_id and resp_template_id and resp_template_id != req_template_id:
+        msg = (
+            f"template_id mismatch between request ({req_template_id}) "
+            f"and response ({resp_template_id})."
+        )
+        _append_metadata_warning(resp, msg)
+        logger.warning(
+            "stage_c_template_id_mismatch",
+            req_template_id=req_template_id,
+            resp_template_id=resp_template_id,
+        )
+        if strict_mode:
+            raise StageCValidationError(msg)
+
+    # job_id
+    req_job_id = getattr(original_request, "job_id", None)
+    resp_job_id = getattr(resp, "job_id", None)
+
+    if req_job_id and not resp_job_id:
+        try:
+            setattr(resp, "job_id", req_job_id)
+        except Exception:
+            pass
+    elif req_job_id and resp_job_id and resp_job_id != req_job_id:
+        msg = f"job_id mismatch between request ({req_job_id}) and response ({resp_job_id})."
+        _append_metadata_warning(resp, msg)
+        logger.warning(
+            "stage_c_job_id_mismatch",
+            req_job_id=req_job_id,
+            resp_job_id=resp_job_id,
+        )
+        if strict_mode:
+            raise StageCValidationError(msg)
+
+    # language
+    req_lang = getattr(original_request, "language", None)
+    resp_lang = getattr(resp, "language", None)
+
+    if req_lang and not resp_lang:
+        try:
+            setattr(resp, "language", req_lang)
+        except Exception:
+            pass
+    elif req_lang and resp_lang and resp_lang != req_lang:
+        msg = f"language mismatch between request ({req_lang}) and response ({resp_lang})."
+        _append_metadata_warning(resp, msg)
+        logger.warning(
+            "stage_c_language_mismatch",
+            req_language=req_lang,
+            resp_language=resp_lang,
+        )
+        if strict_mode:
+            raise StageCValidationError(msg)

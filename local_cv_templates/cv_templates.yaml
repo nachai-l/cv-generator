@@ -1,0 +1,92 @@
+# local_cv_templates/cv_templates.yaml
+
+T_EMPLOYER_STD_V3:
+  name: "Professional Employer Standard"
+  style: "modern"
+  sections_order:
+    - "profile_summary"
+    - "skills"
+    - "experience"
+    - "education"
+    - "projects"
+    - "certifications"
+    - "awards"
+    - "extracurricular"
+    - "volunteering"
+    - "interests"
+  color_scheme:
+    primary: "#2C3E50"
+    secondary: "#3498DB"
+    accent: "#E74C3C"
+    background: "#FFFFFF"
+    text: "#2C3E50"
+    muted: "#95A5A6"
+  font_family: "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+  max_pages: 2
+  max_chars_per_section:
+    profile_summary: 800
+    skills: 1500
+    experience: 6000
+    education: 3000
+    projects: 4000
+    certifications: 2000
+    awards: 2000
+    extracurricular: 3000
+    volunteering: 3000
+    interests: 800
+
+T_MINIMALIST_V1:
+  name: "Minimalist Clean"
+  style: "minimalist"
+  sections_order:
+    - "profile_summary"
+    - "experience"
+    - "education"
+    - "skills"
+    - "awards"
+    - "interests"
+  color_scheme:
+    primary: "#000000"
+    secondary: "#333333"
+    accent: "#666666"
+    background: "#FFFFFF"
+    text: "#000000"
+    muted: "#999999"
+  font_family: "'Helvetica Neue', Helvetica, Arial, sans-serif"
+  max_pages: 1
+  max_chars_per_section:
+    profile_summary: 600
+    experience: 3500
+    education: 2000
+    skills: 1200
+    awards: 1000
+    interests: 600
+
+T_CREATIVE_V1:
+  name: "Creative Tech"
+  style: "creative"
+  sections_order:
+    - "profile_summary"
+    - "skills"
+    - "projects"
+    - "experience"
+    - "education"
+    - "extracurricular"
+    - "interests"
+  color_scheme:
+    primary: "#6C63FF"
+    secondary: "#FF6584"
+    accent: "#00D9FF"
+    background: "#F8F9FA"
+    text: "#2D3436"
+    muted: "#636E72"
+  font_family: "'Poppins', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif"
+  max_pages: 2
+  max_chars_per_section:
+    profile_summary: 800
+    skills: 1600
+    projects: 4500
+    experience: 5000
+    education: 2500
+    extracurricular: 2500
+    interests: 800

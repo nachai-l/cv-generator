@@ -1,0 +1,53 @@
+profile_summary: >
+  Passionate R&D professional with over 8 years of experience in synthetic biology,
+  enzyme engineering, and project leadership. Adept at bridging scientific discovery
+  and commercial strategy to accelerate innovation in biomanufacturing.
+
+skills:
+  - name: "Molecular Biology"
+    level: "Expert"
+  - name: "Synthetic Biology"
+    level: "Advanced"
+  - name: "Project Management"
+    level: "Advanced"
+  - name: "Strategic Planning"
+    level: "Advanced"
+  - name: "Data Analysis"
+    level: "Intermediate"
+
+experience:
+  - title: "Associate Director, Synthetic Biology Research"
+    company: "Mojia Biotech Pte. Ltd."
+    period: "2023–2024"
+    highlights:
+      - "Led enzyme screening and pathway optimization projects for PDO production"
+      - "Secured government research grants and established cross-border collaborations"
+  - title: "Assistant Manager, Research Division"
+    company: "Mitsui Chemicals Singapore R&D Centre"
+    period: "2017–2023"
+    highlights:
+      - "Managed R&D projects and IP strategy for biotechnology applications"
+      - "Awarded 'Most Passionate Idea Award 2021' for healthcare innovation"
+
+education:
+  - degree: "PhD in Biological Science"
+    institution: "Nara Institute of Science and Technology (NAIST)"
+    location: "Japan"
+  - degree: "BSc in Biochemistry"
+    institution: "Mahidol University"
+    location: "Thailand"
+
+certifications:
+  - name: "Project Management Professional (PMP)"
+  - name: "Advanced Biotechnology Workshop"
+    organization: "A*STAR Singapore"
+
+awards:
+  - title: "Top 10 Mahidol University Alumni Leaders 2023"
+  - title: "Most Passionate Idea Award 2021"
+    organization: "Mitsui Chemicals"
+
+interests:
+  - "Japanese culture"
+  - "Science communication"
+  - "Technology-driven sustainability"

@@ -1,0 +1,16 @@
+role_id: "JR-BIO-RND"
+role_name: "Biotechnology R&D Scientist"
+core_competencies:
+  - Molecular biology
+  - Synthetic biology
+  - Bioprocess optimization
+  - Project management
+skill_requirements:
+  L1_Beginner: ["Documentation", "Laboratory safety"]
+  L2_Intermediate: ["PCR", "Data analysis"]
+  L3_Advanced: ["Metabolic engineering", "Fermentation optimization"]
+  L4_Expert: ["Pathway design", "Tech transfer strategy"]
+description: >
+  A biotechnology R&D Scientist is responsible for developing, optimizing, and
+  scaling up biological production systems for new materials, chemicals, or
+  therapeutics. The role bridges molecular-level innovation with industrial application.

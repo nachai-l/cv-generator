@@ -1,0 +1,26 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Local config / secrets
+parameters/credentials.yaml
+*.env
+.env
+.env.*
+
+# Logs & generated artifacts
+local_logs/
+tests/generated_test_cvs/
+
+# OS / editor cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,170 @@
+{
+  "user_id": "U-2001",
+  "language": "en",
+  "template_id": "T_EMPLOYER_STD_V3",
+  "sections": [
+    "profile_summary",
+    "skills",
+    "experience",
+    "projects"
+  ],
+  "student_profile": {
+    "personal_info": {
+      "name": "Alex Park",
+      "email": "alex.park@example.com",
+      "phone": "+81-90-1234-5678",
+      "linkedin": "https://www.linkedin.com/in/alex-park-ai/"
+    },
+    "education": [
+      {
+        "id": "edu#bsc_cs_tokyo",
+        "degree": "BSc in Computer Science",
+        "institution": "The University of Tokyo",
+        "gpa": 3.6,
+        "start_date": "2013-04-01",
+        "graduation_date": "2017-03-31",
+        "major": "Computer Science"
+      },
+      {
+        "id": "edu#msc_ds_kyoto",
+        "degree": "MSc in Data Science",
+        "institution": "Kyoto University",
+        "gpa": 3.9,
+        "start_date": "2018-04-01",
+        "graduation_date": "2020-03-31",
+        "major": "Data Science"
+      }
+    ],
+    "experience": [
+      {
+        "id": "work_exp#fintech_pm",
+        "title": "AI Product Manager",
+        "company": "Sakura Fintech Inc.",
+        "start_date": "2021-04-01",
+        "end_date": null,
+        "responsibilities": [
+          "Owned roadmap for AI-powered credit risk scoring products used by enterprise clients.",
+          "Collaborated with data scientists and engineers to ship models from prototype to production.",
+          "Defined success metrics and ran A/B tests to improve model adoption and user engagement."
+        ]
+      },
+      {
+        "id": "work_exp#ds_bank",
+        "title": "Data Scientist",
+        "company": "Tokyo Digital Bank",
+        "start_date": "2018-04-01",
+        "end_date": "2021-03-31",
+        "responsibilities": [
+          "Developed machine learning models for transaction fraud detection and customer churn prediction.",
+          "Built data pipelines and dashboards to monitor model performance and business KPIs.",
+          "Partnered with compliance and risk teams to ensure responsible AI practices."
+        ]
+      }
+    ],
+    "skills": [
+      {
+        "id": "skill#product_management",
+        "name": "Product Management",
+        "description": "End-to-end ownership of AI product lifecycle from discovery to launch.",
+        "level": "L4_Expert"
+      },
+      {
+        "id": "skill#ml_systems",
+        "name": "Machine Learning Systems",
+        "description": "Designing, deploying, and monitoring production ML services.",
+        "level": "L3_Advanced"
+      },
+      {
+        "id": "skill#stakeholder_comms",
+        "name": "Stakeholder Communication",
+        "description": "Translating technical concepts into clear business impact for executives.",
+        "level": "L3_Advanced"
+      },
+      {
+        "id": "skill#sql_python",
+        "name": "SQL & Python",
+        "description": "Hands-on data analysis, feature engineering, and prototyping.",
+        "level": "L3_Advanced"
+      }
+    ],
+    "awards": [
+      {
+        "id": "award#innovation2023",
+        "title": "Innovation Award 2023",
+        "issuer": "Sakura Fintech Inc.",
+        "date": "2023-12-15",
+        "description": "Recognized for launching an AI-based lending product that increased approval speed by 40%."
+      }
+    ],
+    "extracurriculars": [
+      {
+        "id": "extra#tokyo_ml_meetup",
+        "title": "Organizer, Tokyo ML Meetup",
+        "organization": "Tokyo ML Community",
+        "role": "Lead Organizer",
+        "duration": "2020–Present",
+        "description": "Organizes monthly meetups on practical machine learning and MLOps topics."
+      }
+    ]
+  },
+  "target_role_taxonomy": {
+    "role_title": "AI Product Manager",
+    "role_description": "Leads cross-functional teams to design, build, and scale AI-powered products that deliver measurable business value.",
+    "role_required_skills": [
+      "Product strategy",
+      "Machine learning systems",
+      "Stakeholder communication",
+      "Experiment design",
+      "Data-driven decision making"
+    ]
+  },
+  "target_jd_taxonomy": {
+    "job_title": "Senior AI Product Manager",
+    "job_required_skills": [
+      "Product roadmapping",
+      "ML model lifecycle management",
+      "Cross-functional leadership",
+      "Experimentation and A/B testing",
+      "User-centric discovery"
+    ],
+    "job_responsibilities": [
+      "Define and drive the vision for AI-powered products in the digital banking portfolio.",
+      "Partner with data science, engineering, and design to prioritize and deliver impactful features.",
+      "Establish measurable success metrics and run experiments to validate product hypotheses.",
+      "Communicate roadmap, trade-offs, and results to senior leadership and key stakeholders."
+    ],
+    "company_info": {
+      "name": "Hikari Digital Bank",
+      "industry": "Fintech"
+    }
+  },
+
+  "template_info": {
+    "template_id": "T_EMPLOYER_STD_V3",
+    "name": "Professional Employer Standard",
+    "style": "modern",
+    "sections_order": [
+      "profile_summary",
+      "skills",
+      "education",
+      "projects"
+    ],
+    "color_scheme": {
+      "primary": "#2C3E50",
+      "secondary": "#3498DB",
+      "accent": "#E74C3C",
+      "background": "#FFFFFF",
+      "text": "#2C3E50",
+      "muted": "#95A5A6"
+    },
+    "font_family": "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+    "max_pages": 2,
+    "max_chars_per_section": {
+      "profile_summary": 800,
+      "skills": 2500,
+      "experience": 1200,
+      "education": 2500,
+      "projects": 800
+    }
+  }
+}

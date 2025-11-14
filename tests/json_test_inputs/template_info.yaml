@@ -1,0 +1,41 @@
+template_id: "T_EMPLOYER_STD_V3"
+name: "Professional Employer Standard"
+style: "modern"
+sections_order:
+  - profile_summary
+  - skills
+#  - experience
+  - education
+  - projects
+#  - certifications
+#  - awards
+#  - extracurricular
+#  - volunteering
+#  - interests
+color_scheme:
+  primary: "#2C3E50"
+  secondary: "#3498DB"
+  accent: "#E74C3C"
+  background: "#FFFFFF"
+  text: "#2C3E50"
+  muted: "#95A5A6"
+#color_scheme:
+#  primary: "#0B3D91"       # Deep blue (headings)
+#  secondary: "#F39C12"     # Warm orange (section borders)
+#  accent: "#E74C3C"        # Red accent (unchanged for contrast)
+#  background: "#FDF6E3"    # Soft beige background
+#  text: "#222222"          # Dark neutral text
+#  muted: "#7F8C8D"         # Muted gray for contact info
+font_family: "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+max_pages: 2
+max_chars_per_section:
+  profile_summary: 800
+  skills: 2500
+#  experience: 1200
+  education: 2500
+  projects: 800
+#  certifications: 400
+#  awards: 400
+#  extracurricular: 400
+#  volunteering: 400
+#  interests: 400

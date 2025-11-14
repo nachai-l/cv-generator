@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CV - {{ name }}</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: {{ font_family }};
+            font-size: 11pt;
+            line-height: 1.6;
+            color: {{ colors.text }};
+            background-color: #f5f5f5;
+            padding: 20px;
+        }
+
+        .cv-container {
+            max-width: 210mm;
+            margin: 0 auto;
+            background-color: {{ colors.background }};
+            box-shadow: 0 0 20px rgba(0, 0, 0, 0.1);
+            padding: 40px 50px;
+        }
+
+        .cv-header {
+            border-bottom: 3px solid {{ colors.primary }};
+            padding-bottom: 20px;
+            margin-bottom: 30px;
+        }
+
+        .cv-name {
+            font-size: 32pt;
+            font-weight: 700;
+            color: {{ colors.primary }};
+            margin-bottom: 10px;
+        }
+
+        .cv-contact {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 20px;
+            font-size: 10pt;
+            color: {{ colors.muted }};
+        }
+
+        .cv-section {
+            margin-bottom: 25px;
+            page-break-inside: avoid;
+        }
+
+        .section-title {
+            font-size: 14pt;
+            font-weight: 700;
+            color: {{ colors.primary }};
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 12px;
+            padding-bottom: 5px;
+            border-bottom: 2px solid {{ colors.secondary }};
+        }
+
+        .section-content {
+            font-size: 11pt;
+            line-height: 1.7;
+            color: {{ colors.text }};
+        }
+
+        .section-content p {
+            margin-bottom: 10px;
+            text-align: justify;
+        }
+
+        /* ---- Skills / Interests pills ---- */
+        .inline-list {
+            list-style: none;
+            padding-left: 0;
+            margin: 6px 0 0 0;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+
+        .inline-pill {
+            background-color: #f2f4f8;
+            border-radius: 999px;
+            padding: 4px 10px;
+            font-size: 10pt;
+            border: 1px solid #d0d4da;
+            white-space: nowrap;
+        }
+
+        /* ---- Experience ---- */
+        .experience-item {
+            margin-bottom: 16px;
+        }
+
+        .item-header {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 4px;
+        }
+
+        .item-title {
+            font-weight: 600;
+            color: inherit;
+        }
+
+        .item-meta {
+            font-size: 9pt;
+            color: #7f8c8d;
+            text-align: right;
+        }
+
+        .item-bullets {
+            margin-left: 18px;
+            margin-top: 4px;
+        }
+
+        /* ---- Education ---- */
+        .education-item {
+            margin-bottom: 10px;
+        }
+
+        .education-item .degree {
+            font-weight: 600;
+        }
+
+        .education-item .institution {
+            font-size: 9pt;
+            color: #7f8c8d;
+        }
+
+        /* ---- Certifications / Awards ---- */
+        .stacked-list {
+            list-style: disc;
+            margin-left: 18px;
+            margin-top: 4px;
+        }
+
+        .cv-footer {
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 1px solid {{ colors.muted }};
+            text-align: center;
+            font-size: 8pt;
+            color: {{ colors.muted }};
+        }
+
+        @media print {
+            body {
+                background-color: white;
+                padding: 0;
+            }
+            .cv-container {
+                box-shadow: none;
+                padding: 20mm;
+                max-width: 100%;
+            }
+        }
+
+        @page {
+            size: A4;
+            margin: 15mm;
+        }
+    </style>
+</head>
+<body>
+    <div class="cv-container">
+        <header class="cv-header">
+            <h1 class="cv-name">{{ name }}</h1>
+            <div class="cv-contact">
+                <div>{{ email }}</div>
+                <div>{{ phone }}</div>
+                <div>{{ linkedin }}</div>
+            </div>
+        </header>
+
+        <main>
+            {% for section in sections %}
+            <section class="cv-section">
+                <h2 class="section-title">{{ section.title }}</h2>
+                <div class="section-content">
+                    {# Prefer structured skills list when available #}
+                    {% if section.id == "skills" and skills %}
+                        <ul class="inline-list">
+                            {% for skill in skills %}
+                                <li class="inline-pill">
+                                    {{ skill.name }}
+                                    {% if skill.level %}
+                                        ({{ skill.level | skill_level_label }})
+                                    {% endif %}
+                                </li>
+                            {% endfor %}
+                        </ul>
+                    {% else %}
+                        {{ section.html | safe }}
+                    {% endif %}
+                </div>
+            </section>
+            {% endfor %}
+        </main>
+
+        <footer class="cv-footer">
+            <p>Generated on {{ generated_at_str }} | Job ID: {{ job_id }}</p>
+        </footer>
+    </div>
+</body>
+</html>

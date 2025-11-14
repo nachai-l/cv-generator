@@ -1,0 +1,52 @@
+user_id: "U-1001"
+name: "Dr. Natthaporn Takpho"
+email: "natthaporn.takpho@example.com"
+phone: "+66-81-234-5678"
+linkedin: "https://www.linkedin.com/in/natthaporntakpho/"
+
+education:
+  - degree: "PhD in Biological Science"
+    institution: "Nara Institute of Science and Technology (NAIST)"
+    graduation_year: 2016
+
+experience:
+  - company: "Mitsui Chemicals Singapore R&D Centre"
+    role: "Assistant Manager, Research Division"
+    years: "2017–2023"
+    highlights:
+      - Led enzyme engineering and metabolic pathway optimization projects
+      - Expanded company portfolio into healthcare sector
+
+projects:
+  - name: "Bioconversion Process Optimization"
+    description: >
+      Developed and optimized fermentation processes for bio-based 1,3-propanediol (PDO)
+      production. Integrated enzyme kinetics, strain engineering, and process modeling
+      to enhance yield and productivity.
+    related_skills:
+      - "Bioprocess Engineering"
+      - "Data Analysis"
+
+skills:
+  - name: "Molecular Biology"
+    level: "L4_Expert"
+  - name: "Analytical Thinking"
+    level: "L3_Advanced"
+  - name: "Market Analysis"
+    level: "L3_Advanced"
+  - name: "Strategic Planning"
+    level: "L3_Advanced"
+
+languages:
+  - language: "English"
+    proficiency: "Fluent"
+  - language: "Japanese"
+    proficiency: "Business"
+  - language: "Thai"
+    proficiency: "Native"
+
+summary: >
+  Life sciences R&D professional with 8+ years of experience bridging research,
+  innovation, and commercialization. Expertise in biotechnology, project management,
+  and strategic development across Asia. Passionate about applying cross-disciplinary
+  knowledge to develop data-driven bioprocess and sustainable innovation solutions.

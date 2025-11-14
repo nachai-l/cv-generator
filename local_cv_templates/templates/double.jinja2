@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>CV - {{ name }}</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            font-family: {{ font_family }};
+            font-size: 11pt;
+            color: {{ colors.text }};
+        }
+        body {
+            background: #ffffff;
+        }
+        .page {
+            width: 210mm;
+            min-height: 297mm;
+            margin: 0 auto;
+            padding: 18mm 20mm;
+            display: flex;
+            flex-direction: column;
+        }
+        .header {
+            margin-bottom: 16px;
+        }
+        .name {
+            font-size: 22pt;
+            font-weight: 700;
+            color: {{ colors.primary }};
+            margin-bottom: 4px;
+        }
+        .contact {
+            font-size: 9pt;
+            color: {{ colors.muted }};
+        }
+        .contact span {
+            margin-right: 12px;
+        }
+
+        /* --- Two-column layout --- */
+        .columns {
+            display: grid;
+            grid-template-columns: 38% 60%;
+            gap: 2%;
+            width: 100%;
+        }
+        .column-left, .column-right {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .section {
+            margin-bottom: 14px;
+            page-break-inside: avoid;
+        }
+        .section-title {
+            font-size: 11pt;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: {{ colors.primary }};
+            border-bottom: 1px solid {{ colors.secondary }};
+            padding-bottom: 3px;
+            margin-bottom: 6px;
+        }
+        .section-body {
+            font-size: 10pt;
+            line-height: 1.5;
+        }
+        .section-body p {
+            margin: 0 0 6px 0;
+        }
+        .inline-list {
+            list-style: none;
+            padding: 0;
+            margin: 2px 0 0 0;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+        }
+        .inline-pill {
+            border-radius: 999px;
+            border: 1px solid #cccccc;
+            padding: 2px 8px;
+            font-size: 9pt;
+            white-space: nowrap;
+        }
+        .item-bullets {
+            margin: 2px 0 0 16px;
+        }
+        .item-bullets li {
+            margin-bottom: 2px;
+        }
+        .experience-item {
+            margin-bottom: 10px;
+        }
+        .item-header {
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+            font-size: 10pt;
+        }
+        .item-title {
+            font-weight: 600;
+        }
+        .item-meta {
+            font-size: 9pt;
+            color: #777777;
+            text-align: right;
+        }
+        .education-item {
+            margin-bottom: 6px;
+        }
+        .education-item .degree {
+            font-weight: 600;
+        }
+        .education-item .institution {
+            font-size: 9pt;
+            color: #777777;
+        }
+        .stacked-list {
+            margin: 0 0 0 16px;
+        }
+        .footer {
+            margin-top: 20px;
+            font-size: 8pt;
+            color: {{ colors.muted }};
+            text-align: right;
+        }
+        @page {
+            size: A4;
+            margin: 15mm;
+        }
+    </style>
+</head>
+<body>
+<div class="page">
+    <header class="header">
+        <div class="name">{{ name }}</div>
+        <div class="contact">
+            <span>{{ email }}</span>
+            <span>{{ phone }}</span>
+            <span>{{ linkedin }}</span>
+        </div>
+    </header>
+
+    <main class="columns">
+        <div class="column-left">
+            {% for section in sections %}
+                {% if section.id in ["profile_summary", "skills", "education", "certifications", "awards", "interests"] %}
+                <section class="section">
+                    <h2 class="section-title">{{ section.title }}</h2>
+                    <div class="section-body">
+                        {# Prefer structured skills list when available #}
+                        {% if section.id == "skills" and skills %}
+                            <ul class="inline-list">
+                                {% for skill in skills %}
+                                    <li class="inline-pill">
+                                        {{ skill.name }}
+                                        {% if skill.level %}
+                                            ({{ skill.level | skill_level_label }})
+                                        {% endif %}
+                                    </li>
+                                {% endfor %}
+                            </ul>
+                        {% else %}
+                            {{ section.html | safe }}
+                        {% endif %}
+                    </div>
+                </section>
+                {% endif %}
+            {% endfor %}
+        </div>
+
+        <div class="column-right">
+            {% for section in sections %}
+                {% if section.id not in ["profile_summary", "skills", "education", "certifications", "awards", "interests"] %}
+                <section class="section">
+                    <h2 class="section-title">{{ section.title }}</h2>
+                    <div class="section-body">
+                        {{ section.html | safe }}
+                    </div>
+                </section>
+                {% endif %}
+            {% endfor %}
+        </div>
+    </main>
+
+    <footer class="footer">
+        Generated on {{ generated_at_str }} · Job ID: {{ job_id }}
+    </footer>
+</div>
+</body>
+</html>
