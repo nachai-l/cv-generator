@@ -160,6 +160,11 @@ def _load_parameters() -> Dict[str, Any]:
 
 @lru_cache(maxsize=1)
 def _get_api_key() -> Optional[str]:
+    # If env already has it, just use that
+    env_key = os.getenv("GOOGLE_API_KEY")
+    if env_key:
+        return env_key
+
     creds = _load_credentials()
     api_key = creds.get("GOOGLE_API_KEY") or creds.get("google_api_key")
     if not api_key:
@@ -187,7 +192,7 @@ def _use_stub_llm() -> bool:
 
     Order:
       1) parameters.yaml model.use_stub or generation.use_stub → True
-      2) No API key → True
+      2) No API key (env or credentials) → True
       3) No usable SDKs → True
       4) Else False
     """
@@ -203,7 +208,7 @@ def _use_stub_llm() -> bool:
         logger.info("llm_stub_enabled_by_generation_config")
         return True
 
-    if not _get_api_key():
+    if not _ensure_env_api_key():
         logger.info("llm_stub_enabled_no_api_key")
         return True
 
@@ -212,6 +217,7 @@ def _use_stub_llm() -> bool:
         return True
 
     return False
+
 
 
 # ---------------------------------------------------------------------------
