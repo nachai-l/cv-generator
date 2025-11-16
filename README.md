@@ -589,16 +589,3 @@ pricing:
     usd_per_output_token: 0.00000250
 ```
 
----
-
-## License
-
-[Add your license information here]
-
-## Contributing
-
-[Add contribution guidelines here]
-
-## Contact
-
-[Add contact information here]
