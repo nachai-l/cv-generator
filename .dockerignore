@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+
+local_logs/
+tests/generated_test_cvs/
+
+# Git
+.git
+.gitignore
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Local secrets (we do NOT bake this into image)
+parameters/credentials.yaml
