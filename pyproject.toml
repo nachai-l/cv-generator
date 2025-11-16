@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
+
 dependencies = [
     "email-validator>=2.3.0",
     "fastapi>=0.121.0",
@@ -19,4 +20,6 @@ dependencies = [
     "python-dotenv>=1.2.1",
     "structlog>=25.5.0",
     "tree>=0.2.4",
+    # Added for FastAPI server runtime
+    "uvicorn[standard]>=0.32.0",
 ]
