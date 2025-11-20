@@ -378,6 +378,128 @@ def _get_section_char_limits(request: CVGenerationRequest) -> Dict[str, int]:
         return {}
     return dict(tmpl.max_chars_per_section)
 
+def _extract_year_from_date(value: Any) -> str | None:
+    """Best-effort extraction of a year (YYYY) from a date-like value.
+
+    Accepts:
+    - ISO date strings: '2015-08-01' -> '2015'
+    - datetime/date objects -> str(year)
+    - already-a-year strings -> '2015'
+    """
+    if value is None:
+        return None
+
+    # datetime/date-like
+    try:
+        import datetime as _dt
+
+        if isinstance(value, (_dt.date, _dt.datetime)):
+            return str(value.year)
+    except Exception:
+        # datetime may not be imported or value not a date; ignore
+        pass
+
+    if isinstance(value, str):
+        s = value.strip()
+        if len(s) >= 4 and s[:4].isdigit():
+            return s[:4]
+
+    return None
+
+
+def _format_education_fact_entry(entry: Any) -> str | None:
+    """Format a single education entry into a concise fact string.
+
+    Supports:
+    - object-like entries (attrs: degree, institution, major, gpa, start_date, graduation_date)
+    - dict-like entries with the same keys
+    - plain strings (returned as-is)
+    """
+    if isinstance(entry, str):
+        val = entry.strip()
+        return val or None
+
+    # Attribute or dict access helpers
+    def _get(attr: str) -> Any:
+        if hasattr(entry, attr):
+            return getattr(entry, attr)
+        if isinstance(entry, dict):
+            return entry.get(attr)
+        return None
+
+    degree = _get("degree")
+    institution = _get("institution")
+    major = _get("major")
+    gpa = _get("gpa")
+    start_date = _get("start_date")
+    graduation_date = _get("graduation_date")
+
+    parts: List[str] = []
+
+    # Degree + major
+    if degree and major:
+        parts.append(str(degree))
+        # Major might already be in degree name; keep it explicit for robustness
+        parts.append(f"Major: {major}")
+    elif degree:
+        parts.append(str(degree))
+    elif major:
+        parts.append(f"Major: {major}")
+
+    # Institution
+    if institution:
+        parts.append(str(institution))
+
+    # GPA
+    if gpa is not None:
+        parts.append(f"GPA: {gpa}")
+
+    # Years
+    start_year = _extract_year_from_date(start_date)
+    end_year = _extract_year_from_date(graduation_date)
+    if start_year or end_year:
+        if start_year and end_year:
+            parts.append(f"Years: {start_year}–{end_year}")
+        elif start_year:
+            parts.append(f"Years: {start_year}–")
+        else:
+            parts.append(f"Years: –{end_year}")
+
+    if not parts:
+        return None
+
+    return " | ".join(parts)
+
+
+def _collect_education_facts_from_request(request: CVGenerationRequest) -> List[str]:
+    """Collect education facts from student_profile or legacy profile_info.
+
+    This is used to enrich the LLM prompt for the 'education' section.
+    """
+    facts: List[str] = []
+
+    # Preferred path: student_profile.education
+    student_profile = getattr(request, "student_profile", None)
+    if student_profile is not None:
+        edu_list = getattr(student_profile, "education", None)
+        if edu_list:
+            for entry in edu_list:
+                fact = _format_education_fact_entry(entry)
+                if fact:
+                    facts.append(fact)
+
+    # Legacy / fallback: profile_info["education"]
+    if not facts:
+        profile_info = getattr(request, "profile_info", {}) or {}
+        edu_list = profile_info.get("education")
+        if edu_list:
+            for entry in edu_list:
+                fact = _format_education_fact_entry(entry)
+                if fact:
+                    facts.append(fact)
+
+    return facts
+
 
 @lru_cache(maxsize=1)
 def _load_skills_alias_map() -> dict[str, str]:
@@ -889,9 +1011,21 @@ class CVGenerationEngine:
 
         user_draft = drafts.get(section_id)
 
-        evidence_facts: List[str] = _collect_evidence_facts_for_section(
-            evidence_plan, section_id
-        )
+        # ------------------------------------------------------------
+        # Evidence facts + education-specific enrichment
+        # ------------------------------------------------------------
+        evidence_facts: List[str] = []
+
+        # From EvidencePlan (if any)
+        ep_facts = _collect_evidence_facts_for_section(evidence_plan, section_id)
+        if ep_facts:
+            evidence_facts.extend(ep_facts)
+
+        # Enrich education section with structured education info
+        if section_id == "education":
+            edu_facts = _collect_education_facts_from_request(request)
+            if edu_facts:
+                evidence_facts.extend(edu_facts)
 
         lines: List[str] = [
             "You are an expert CV writer.",
@@ -920,6 +1054,7 @@ class CVGenerationEngine:
             [f"- {fact}" for fact in evidence_facts]
             or ["- (No specific evidence provided)"]
         )
+
 
         if user_draft:
             lines.append(f"\n=== User Draft for {section_id} ===")

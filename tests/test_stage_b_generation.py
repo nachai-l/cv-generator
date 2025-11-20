@@ -1422,5 +1422,61 @@ class TestReconcileOnlyInferredSkills(LoggingTestCase):
         self.assertEqual(fixed[0].level, "L2")
         self.assertEqual(fixed[0].source, "inferred")
 
+
+class TestEducationPromptBuilding(LoggingTestCase):
+    """Tests for _build_section_prompt for education."""
+
+    def test_build_education_prompt_includes_full_education_facts(self) -> None:
+        """Education prompt should include degree, institution, major, GPA, and dates if available."""
+        class DummyEdu:
+            def __init__(self) -> None:
+                self.id = "edu#bsc_kasetsart_cs"
+                self.degree = "BSc in Computer Science"
+                self.institution = "Kasetsart University"
+                self.gpa = 3.6
+                self.start_date = "2015-08-01"
+                self.graduation_date = "2019-05-31"
+                self.major = "Computer Science"
+
+        class DummyStudentProfile:
+            def __init__(self) -> None:
+                self.education = [DummyEdu()]
+
+        # No evidence_plan needed here – we rely on request.student_profile
+        req = DummyRequest(
+            sections=["education"],
+            language="en",
+            template_info=DummyTemplateInfo(template_id="T_EMPLOYER_STD_V3"),
+            profile_info={"name": "Test User"},
+        )
+        # Attach duck-typed student_profile with full education info
+        req.student_profile = DummyStudentProfile()  # type: ignore[attr-defined]
+
+        engine = CVGenerationEngine(
+            llm_client=lambda *_a, **_k: "ignored",
+            generation_params={"log_prompts": False},
+        )
+
+        req_typed = cast(CVGenerationRequest, cast(object, req))
+
+        prompt = engine._build_section_prompt(
+            request=req_typed,
+            evidence_plan=None,
+            section_id="education",
+        )
+
+        # Degree and institution
+        self.assertIn("BSc in Computer Science", prompt)
+        self.assertIn("Kasetsart University", prompt)
+        # Major
+        self.assertIn("Computer Science", prompt)
+        # GPA
+        self.assertIn("3.6", prompt)
+        # Dates (at least the years should appear)
+        self.assertIn("2015", prompt)
+        self.assertIn("2019", prompt)
+        # Output requirements marker (same structure as other sections)
+        self.assertIn("=== Output Requirements ===", prompt)
+
 if __name__ == "__main__":
     unittest.main()
