@@ -26,32 +26,35 @@ ROOT = Path(__file__).resolve().parents[2]
 # yaml reader
 # ---------------------------------------------------------------------------
 
-def load_yaml_dict(path: Path) -> Dict[str, Any]:
+from pathlib import Path
+from typing import Any, Mapping
+
+def load_yaml_dict(path: str | Path) -> dict[str, Any]:
     """
-    Safely load a YAML file into a dict.
-    Returns {} on any failure (missing file, parse error, wrong type).
+    Load a YAML file into a dict. Accepts either a string path or a Path object.
+    Returns {} on any error, and logs via structlog.
     """
+
     try:
-        if not path.exists():
-            logger.info("yaml_file_missing", path=str(path))
+        p = Path(path)
+        if not p.exists():
+            logger.error("yaml_file_not_found", path=p)
             return {}
-        with path.open("r", encoding="utf-8") as f:
+
+        import yaml
+
+        with p.open("r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
+
         if not isinstance(data, dict):
-            logger.warning(
-                "yaml_file_not_dict",
-                path=str(path),
-                type=str(type(data))
-            )
+            logger.error("yaml_file_not_a_mapping", path=p)
             return {}
+
         return data
-    except Exception as e:  # pragma: no cover
-        logger.exception(
-            "yaml_file_load_error",
-            path=str(path),
-            error=str(e)
-        )
+    except Exception as exc:
+        logger.error("yaml_file_load_error", path=path, error=str(exc))
         return {}
+
 
 # ---------------------------------------------------------------------------
 # Pydantic helpers (v1 / v2)

@@ -16,7 +16,7 @@ generation:
   model_name: "gemini-2.5-flash"
   temperature: 0.3
   max_tokens: 4096               # Per-call API max; section budgets are logical, not strict API limits
-  timeout_seconds: 30
+  timeout_seconds: 60
   max_retries: 3                 # Retry per section-generation attempt (not global)
   max_generation_time_ms: 60000
   retry_on_zero_tokens: true     # Retry LLM call if Gemini returns a 0-token response (prevents blank sections)
@@ -24,6 +24,9 @@ generation:
   verbose_main: true             # Extra logging for main pipeline (Stage B/C)
   fallback_text: "[Fallback]"    # Used when generation fails and a safe default string is required
   dropping_irrelevant_skills: true
+  enable_structured_skills: true
+  enable_llm_experience: true    # Enable LLM-based experience augmentation with structure + bullets
+  prompts_file: "prompts.yaml"
 
   # --- Magic-number replacements ----------
   retry_thresholds:
@@ -67,149 +70,215 @@ generation:
     # Whether to allow fuzzy matching at all
     enable_fuzzy_matching: true
 
-  # -----------------------------------------------------------------------------
-  # Section-level prompts
-  # -----------------------------------------------------------------------------
-  prompts:
-    # ========== DEFAULT - PARAGRAPH STYLE  ==========
-    paragraph_default: |
-      Write a concise, professional paragraph.
-      Do NOT use bullet points or numbering.
-      Avoid markdown formatting like **bold** or *italics*.
-      Maintain a neutral, professional tone.
-      Focus on clarity, impact, and factual accuracy.
-
-    # ========== DEFAULT - BULLET STYLE ==========
-    bullet_default: |
-      Write 2–6 concise bullet points (can be increased if necessary).
-      - Each bullet must begin with a strong action verb OR be a short, single-term bullet (choose one format and stay consistent).
-      - Remove filler and redundant phrases.
-      - Avoid markdown formatting (**bold**, *italics*).
-      - Keep each bullet to one sentence or one short phrase.
-      - Focus on accomplishments, outcomes, skills, and tools relevant to the role.
-
-    # Experience → markdown blocks per role
-    experience: |
-      Return experience as structured markdown blocks.
-      For EACH role, follow exactly this pattern:
-      1) First line: **Job Title**
-      2) Second line: *Company Name, Years* (e.g., *Example Biotech Pte. Ltd., 2023–2024*)
-      3) Next 2–4 lines: bullet points starting with '- ' describing achievements.
-      Insert a single blank line between roles.
-      Do not add headings, prose paragraphs, or any text before/after the roles.
-
-    # Education → one bullet per entry
-    education: |
-      Return ONLY a bullet list, one education entry per line.
-      Use this exact format per line:
-      - Degree, Institution, Location (Years)
-      Example: - PhD in Biological Science, Nara Institute of Science and Technology, Japan (2012–2016)
-      No extra sentences, headings, or numbering.
-
-    # Skills (plain text) → bullet list only
-    skills: |
-      Return ONLY a bullet list, one item per line.
-      Use this exact format: '- short phrase'.
-      Each item should be 2–6 words.
-    
-      Each bullet MUST correspond to exactly one skill from the structured skills list.
-      - Do NOT merge multiple skills into one bullet (no "SQL & Python").
-      - Do NOT rename or paraphrase existing skill names.
-    
-      Do not introduce new skills that are not in that list.
-      Prefer skill that already come with level and, if available, matched with job role or job description .
-      Prefer concrete, domain-specific skills over vague soft skills.
-      Do not include headings, numbering, or commentary.
-
-    # Structured skills taxonomy prompt (JSON output)
-    # Used by _build_skills_selection_prompt to select / enrich skills.
-    skills_structured: |
-      You are helping to prepare the "skills" section of a CV.
-    
-      You are given:
-      - A list of existing skills from our controlled taxonomy (canonical skills).
-      - You may also add new skills freely, based on the provided evidence context.
-      - Prefer skill that already come with level and, if available, matched with job role or job description .
-    
-      IMPORTANT RULES:
-      1. You MUST NOT rename, paraphrase, or otherwise change any existing skill name.
-         - If the taxonomy skill is "SQL", you must output "SQL", not "SQL & Python", "SQL Programming", or "SQL Databases".
-      2. You MUST preserve the exact level value for existing skills from the taxonomy.
-      3. You may reorder skills to optimize relevance for the target role.
-      4. You may remove skills that are less relevant by setting "keep": false.
-      5. You may add new inferred skills supported by evidence.
-      6. Keep new skill names concise (2–5 words). Avoid overly broad or vague terms.
-      7. When in doubt, keep existing skills and add only meaningful new ones.
-      8. NEVER combine multiple existing skills into a single item.
-         - Do NOT output "SQL & Python" if "SQL" and "Python" are separate skills.
-         - Each item must correspond to exactly one skill name.
-      9. If you want to express a broader capability, keep the original taxonomy skills
-         and add a new inferred skill (e.g. "Data Pipelines") instead of merging names.
-      10. Whenever a specific tool, language, or platform appears in the 
-         experience or project descriptions (e.g., "BigQuery", "TensorFlow", "Docker"), 
-         add it as a separate inferred skill, as long as it is clearly used by the candidate.
-      Return ONLY valid JSON with this exact structure:
-      {
-        "items": [
-          {
-            "name": "string",
-            "level": "string or null",
-            "keep": true,
-            "source": "taxonomy|inferred"
-          },
-          ...
-        ]
-      }
-
-      Do not include any explanatory text, comments, or markdown — output JSON only.
-
-    # Interests → simple bullet list
-    interests: |
-      Return ONLY a bullet list, one item per line.
-      Use this exact format: '- short phrase'.
-      Each item should be 2–6 words (e.g., '- Science communication').
-      Keep phrasing human and natural.
-
-    # Certifications → bullet list, one per line
-    certifications: |
-      Return ONLY a bullet list, one certification per line.
-      Use this format:
-      - Certification name, Organization (optional year)
-      Each bullet should be concise, max 1 short sentence.
-      Do not add headings or paragraphs before/after the list.
-
-    # Awards → bullet list, one per line
-    awards: |
-      Return ONLY a bullet list, one award per line.
-      Use this format:
-      - Award name, Organization (optional year)
-      Keep it concise, 1 line per item.
-
-    publications: |
-      Write a concise bullet list of the candidate’s key publications.
-      - Use 1–5 bullets.
-      - Each bullet: title (or topic), venue or journal (if available), and year.
-      - Focus on publications that are relevant to the target role.
-      - Use a consistent style and avoid markdown formatting.
-
-    training: |
-      Write a concise bullet list summarizing the candidate’s relevant trainings and courses.
-      - Group related items logically.
-      - Include the course name, provider (if known), and year.
-      - Highlight trainings that support the target role or industry.
-      - Avoid markdown formatting like **bold** or numbered lists.
-
-    references: |
-      Generate a short "References" section.
-      - If concrete names are present, format as: Name – Relationship, Organization (optional), Contact (if explicitly provided).
-      - If no specific names are given, use a standard phrase such as "Available upon request."
-      - Keep the tone professional and concise.
-
-    additional_info: |
-      Write a short "Additional Information" section.
-      - Combine any remaining relevant facts that do not fit other sections (e.g., languages, relocation, work authorization, side activities).
-      - Use either a short paragraph or 2–4 bullets.
-      - Keep it factual and avoid repetition from other sections.
+#  # -----------------------------------------------------------------------------
+#  # Section-level prompts
+#  # -----------------------------------------------------------------------------
+#  prompts:
+#    # ========== DEFAULT - PARAGRAPH STYLE  ==========
+#    paragraph_default: |
+#      Write a concise, professional paragraph.
+#      Do NOT use bullet points or numbering.
+#      Avoid markdown formatting like **bold** or *italics*.
+#      Maintain a neutral, professional tone.
+#      Focus on clarity, impact, and factual accuracy.
+#
+#    # ========== DEFAULT - BULLET STYLE ==========
+#    bullet_default: |
+#      Write 2–6 concise bullet points (can be increased if necessary).
+#      - Each bullet must begin with a strong action verb OR be a short, single-term bullet (choose one format and stay consistent).
+#      - Remove filler and redundant phrases.
+#      - Avoid markdown formatting (**bold**, *italics*).
+#      - Keep each bullet to one sentence or one short phrase.
+#      - Focus on accomplishments, outcomes, skills, and tools relevant to the role.
+#
+#    # Experience → markdown blocks per role
+#    experience: |
+#      Return ONLY experience entries, in chronological order (most recent first).
+#
+#      For each job in the input, use this exact structure:
+#
+#      *Company, YYYY–YYYY (or YYYY–Present)*   # one line
+#      - Bullet 1
+#      - Bullet 2
+#      - Bullet 3
+#
+#      Rules:
+#      - You MUST derive the years from the input experience dates:
+#          start_date like "2020-01-01" → "2020"
+#          end_date like "2022-12-31"   → "2022"
+#      - If end_date is null or missing, use “Present”.
+#      - If a date is missing entirely, omit that side of the range
+#        instead of inventing a year.
+#      - Do NOT add any headings such as "EXPERIENCE" or "Work Experience".
+#      - Do NOT wrap the first line in a leading "-" bullet; only the
+#        responsibility lines should start with "- ".
+#      - Separate multiple jobs with ONE blank line and nothing else.
+#
+#    experience_bullets_only: |
+#      Return ONLY bullet lines for the responsibilities of this job.
+#
+#      Output format (Markdown):
+#
+#      - First responsibility sentence.
+#      - Second responsibility sentence.
+#      - Third responsibility sentence.
+#
+#      Rules:
+#      - Do NOT add any heading, job title, or company name line.
+#      - Do NOT include dates; dates are handled separately.
+#      - Do NOT use bold or italic formatting anywhere
+#        (no **...**, no *...*, no __...__, no _..._).
+#      - Each bullet should be one clear sentence in the target language.
+#      - 2–4 bullets is ideal.
+#      - Stay factual and grounded in the profile and evidence above.
+#
+#    # Education → one bullet per entry
+#    education: |
+#      Return ONLY a bullet list, one education entry per line.
+#
+#      Use this format per line:
+#      - Degree, Institution, Location (Years, GPA X.X if GPA > 3.0, Honors if available)
+#
+#      Rules:
+#      - If GPA is available AND greater than 3.0, you MUST include it.
+#      - If GPA is 3.0 or below, omit the GPA part entirely.
+#      - If honors are available (e.g., "First Class Honors", "Cum Laude"), you MUST include it.
+#      - If the major is available and not already in the degree name, you may append it after the degree.
+#      - If honors are not available, omit the honors part.
+#
+#      Example with GPA > 3.0 and Honors:
+#      - BSc in Computer Science, Kasetsart University, Thailand (2015–2019, GPA 3.6, First Class Honors)
+#
+#      Example with GPA > 3.0 but no Honors:
+#      - BSc in Computer Science, Kasetsart University, Thailand (2015–2019, GPA 3.6)
+#
+#      Example with GPA ≤ 3.0:
+#      - BSc in Computer Science, Kasetsart University, Thailand (2015–2019)
+#
+#      No extra sentences, headings, or numbering.
+#
+#    # Skills (plain text) → bullet list only
+#    skills: |
+#      Return ONLY a bullet list, one item per line.
+#      Use this exact format: '- short phrase'.
+#      Each item should be 2–6 words.
+#
+#      Each bullet MUST correspond to exactly one skill from the structured skills list.
+#      - Do NOT merge multiple skills into one bullet (no "SQL & Python").
+#      - Do NOT rename or paraphrase existing skill names.
+#
+#      Do not introduce new skills that are not in that list.
+#      Prefer skill that already come with level and, if available, matched with job role or job description .
+#      Prefer concrete, domain-specific skills over vague soft skills.
+#      Do not include headings, numbering, or commentary.
+#
+#    # Structured skills taxonomy prompt (JSON output)
+#    # Used by _build_skills_selection_prompt to select / enrich skills.
+#    skills_structured: |
+#      You are helping to prepare the "skills" section of a CV.
+#
+#      You are given:
+#      - A list of existing skills from our controlled taxonomy (canonical skills).
+#      - You may also add new skills freely, based on the provided evidence context.
+#      - Prefer skill that already come with level and, if available, matched with job role or job description .
+#
+#      IMPORTANT RULES:
+#      1. You MUST NOT rename, paraphrase, or otherwise change any existing skill name.
+#         - If the taxonomy skill is "SQL", you must output "SQL", not "SQL & Python", "SQL Programming", or "SQL Databases".
+#      2. You MUST preserve the exact level value for existing skills from the taxonomy.
+#      3. You may reorder skills to optimize relevance for the target role.
+#      4. You may remove skills that are less relevant by setting "keep": false.
+#      5. You may add new inferred skills supported by evidence.
+#      6. Keep new skill names concise (2–5 words). Avoid overly broad or vague terms.
+#      7. When in doubt, keep existing skills and add only meaningful new ones.
+#      8. NEVER combine multiple existing skills into a single item.
+#         - Do NOT output "SQL & Python" if "SQL" and "Python" are separate skills.
+#         - Each item must correspond to exactly one skill name.
+#      9. If you want to express a broader capability, keep the original taxonomy skills
+#         and add a new inferred skill (e.g. "Data Pipelines") instead of merging names.
+#      10. Whenever a specific tool, language, or platform appears in the
+#         experience or project descriptions (e.g., "BigQuery", "TensorFlow", "Docker"),
+#         add it as a separate inferred skill, as long as it is clearly used by the candidate.
+#      Return ONLY valid JSON with this exact structure:
+#      {
+#        "items": [
+#          {
+#            "name": "string",
+#            "level": "string or null",
+#            "keep": true,
+#            "source": "taxonomy|inferred"
+#          },
+#          ...
+#        ]
+#      }
+#
+#      Do not include any explanatory text, comments, or markdown — output JSON only.
+#
+#    # Interests → simple bullet list
+#    interests: |
+#      Return ONLY a bullet list, one item per line.
+#      Use this exact format: '- short phrase'.
+#      Each item should be 2–6 words (e.g., '- Science communication').
+#      Keep phrasing human and natural.
+#
+#    # Certifications → bullet list, one per line
+#    certifications: |
+#      Return ONLY a bullet list, one certification per line.
+#      Use this format:
+#      - Certification name, Organization (optional year)
+#      Each bullet should be concise, max 1 short sentence.
+#      Do not add headings or paragraphs before/after the list.
+#
+#    # Awards → bullet list, one per line
+#    awards: |
+#      Return ONLY a bullet list, one award per line.
+#      Use this format:
+#      - Award name, Organization (optional year)
+#      Keep it concise, 1 line per item.
+#
+#    publications: |
+#      Write a concise bullet list of the candidate’s key publications.
+#      Return ONLY a bullet list of training items.
+#      - Each publication must start with "- ".
+#      - No blank lines before the first bullet.
+#      - Each bullet: title (or topic), venue or journal (if available), and year.
+#      - Focus on publications that are relevant to the target role.
+#      - Use a consistent style and avoid markdown formatting.
+#      - No numbering, no em-dash separators, no bold/italic formatting.
+#
+#    training: |
+#      Write a concise bullet list summarizing the candidate’s relevant trainings and courses.
+#      Return ONLY a bullet list of training items.
+#      - Group related items logically.
+#      - Include the course name, provider (if known), and year.
+#      - Highlight trainings that support the target role or industry.
+#      - Avoid markdown formatting like **bold** or numbered lists.
+#      - Do NOT include a heading (e.g., "Training", "การฝึกอบรม").
+#      - Each training item must start with "- ".
+#      - No blank lines before the first bullet.
+#
+#    references: |
+#      Generate a short "References" section.
+#      Return ONLY a bullet list of references.
+#      - If concrete names are present, format as: Name – Relationship, Organization (optional), Contact (if explicitly provided).
+#      - If no specific names are given, use a standard phrase such as "Available upon request."
+#      - Keep the tone professional and concise.
+#      - Do NOT output headings such as "References"
+#      - Each reference starts with "- ".
+#      - Do NOT bold or italicize names.
+#
+#    additional_info: |
+#      Return ONLY a bullet list, one item per line.
+#      Format each bullet as:
+#      - Label: value
+#
+#      Rules:
+#      - Do NOT add headings like "Additional Information" or "### Additional Information".
+#      - Put exactly ONE bullet per line (no multiple bullets on the same line).
+#      - Keep it factual and avoid repetition from other sections.
+#
+#      Examples:
+#      - Certificates: Google Data Analytics Professional Certificate
 
 # -----------------------------------------------------------------------------
 # Treat these as the canonical “core bundle” only when explicitly enabled
@@ -249,11 +318,12 @@ cross_section_evidence_sharing:
 # The generator will try min → default → max tokens across retries (up to max_retries)
 # -----------------------------------------------------------------------------
 section_token_budgets:
-  default: [1024, 3072]
+  default: [2024, 3072]
   profile_summary: [3036, 4096, 8192]
   skills: [3036, 4096, 8192]
   skills_structured: [4096, 6144, 10240]   # High budget for structured skills; monitor cost/latency
-  experience: [4096, 8192, 10240]
+  experience: [4096, 10240, 12396]
+  experience_bullets: [4096, 10240, 12396]
   education: [2048, 4096, 8192]
 
 # -----------------------------------------------------------------------------

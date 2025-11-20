@@ -106,7 +106,8 @@
             gap: 12px;
             margin-bottom: 4px;
         }
-
+        .item-company { font-weight: 600; }
+        .item-years { font-weight: 400; }
         .item-title {
             font-weight: 600;
             color: inherit;
@@ -121,7 +122,20 @@
         .item-bullets {
             margin-left: 18px;
             margin-top: 4px;
+            font-weight: 400;
         }
+        /* Force normal weight for all other content */
+        .experience-item p,
+        .experience-item li,
+        .experience-item ul,
+        .experience-item .item-bullets,
+        .experience-item .item-bullets *,
+        .section-content p,
+        .section-content li,
+        .section-content ul {
+            font-weight: 400 !important; /* Normal weight for content */
+        }
+
 
         /* ---- Education ---- */
         .education-item {

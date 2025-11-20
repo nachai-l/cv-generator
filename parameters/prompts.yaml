@@ -1,0 +1,227 @@
+# prompts.yaml
+#
+# Centralized prompt definitions for Stage B (CV generation).
+# Loaded via PROMPTS_FILE / _load_prompts_from_file() in stage_b_generation.py.
+#
+# Top-level keys are referenced by section_id (e.g. "profile_summary", "skills")
+# or by explicit lookups (e.g. "skills_structured", "experience_bullets_only",
+# "user_draft_rewrite_suffix").
+
+# -------------------------------------------------------------------
+# Generic defaults
+# -------------------------------------------------------------------
+default: |
+  Write a concise, professional paragraph for this CV section.
+  Do not use bullet points or numbering.
+  Avoid markdown formatting such as **bold**, *italics*, or headings.
+  Stay factual and grounded in the profile and evidence provided.
+  Make the text easy to skim for a recruiter.
+
+user_draft_rewrite_suffix: |
+  Rewrite the above draft so it is clearer, more concise, and more impactful.
+  Do not copy sentences verbatim; rephrase entirely in your own words while preserving factual accuracy.
+  Treat this draft as raw information — you may enrich it with relevant details drawn from other sections
+  (such as experience, education, or achievements) if it helps improve clarity or flow.
+  Maintain a consistent professional tone and ensure the structure matches the expected output format.
+
+# -------------------------------------------------------------------
+# Profile summary
+# -------------------------------------------------------------------
+profile_summary: |
+  Write a strong profile summary for a CV in the target language.
+  Use 3–5 sentences in a single paragraph, no bullet points.
+  Briefly cover:
+    - current role or field of study,
+    - key strengths and technical / domain expertise,
+    - relevant achievements or impact,
+    - overall career direction or interests.
+  Keep the tone confident but not exaggerated.
+  Avoid repeating basic contact information or headings.
+
+# -------------------------------------------------------------------
+# Skills (text section) + structured skills (JSON)
+# -------------------------------------------------------------------
+skills: |
+  Write the skills section as a concise bulleted list.
+  Group related skills together where appropriate (e.g. Programming, Data, Tools).
+  Each bullet should start with "- " and list a short set of skills separated by commas.
+  Focus on skills that are clearly supported by the profile and evidence.
+  Do not invent unrelated skills or tools that are not implied by the profile.
+  Do not add headings or subheadings; only bullets.
+
+skills_structured: |
+  You will generate a structured list of skills for this CV.
+  Use the canonical skills (with levels) as the primary source of truth.
+  You may:
+    - keep canonical skills as-is,
+    - drop clearly irrelevant skills,
+    - add new skills that are strongly implied by the profile and evidence.
+  Every skill must be backed by the profile, experience, or education; do not hallucinate.
+
+  IMPORTANT OUTPUT REQUIREMENTS:
+  - Return ONLY valid JSON, with no markdown, comments, or extra text.
+  - Preferred format is an object with an "items" list:
+      {
+        "items": [
+          { "name": "Skill name", "level": "Intermediate", "source": "taxonomy" },
+          { "name": "Another skill", "level": "Advanced",    "source": "inferred" }
+        ]
+      }
+    If you must return a bare list, it MUST be:
+      [
+        { "name": "...", "level": "...", "source": "..." },
+        ...
+      ]
+  - For each item:
+      - name:   a short, human-readable skill name in the target language.
+      - level:  a simple textual level such as "Beginner", "Intermediate", "Advanced",
+                or reuse the level labels provided by the canonical skills.
+      - source: "taxonomy" for canonical skills, "inferred" for newly inferred skills.
+
+  Do NOT include any explanatory prose in the JSON.
+
+# -------------------------------------------------------------------
+# Experience: style guide + bullets-only generator
+# -------------------------------------------------------------------
+experience: |
+  This is a style guide for the work experience section of a CV.
+  The section will be rendered with one header per role (job title, company, dates)
+  followed by bullet points describing responsibilities and achievements.
+
+  Style rules for the bullets:
+    - Use concise, action-oriented bullets starting with strong verbs (e.g. "Led", "Implemented", "Improved").
+    - Focus on achievements, impact, and outcomes rather than generic duties.
+    - Where possible, include metrics or concrete results (e.g. "% improvement", time saved, scale).
+    - Keep each bullet to one sentence, avoiding unnecessary filler.
+    - Avoid first-person pronouns ("I", "we") and keep a consistent professional tone.
+    - Avoid copying text directly from the profile; paraphrase and condense.
+
+experience_bullets_only: |
+  Generate bullet points for a single work experience entry in a CV.
+
+  INPUT:
+    - Candidate profile and context.
+    - A single experience item (job title, company, dates, existing bullets if any).
+    - Optional user-provided draft text.
+    - Relevant evidence facts.
+
+  OUTPUT RULES:
+    - Return ONLY bullet points, no headings, no paragraphs, no explanation.
+    - Each bullet MUST start with "- " followed by a space.
+    - Generate 2–6 bullets (aim for around 3–4 when reasonable).
+    - Even if existing bullets are provided, rewrite them to be clearer, more concise,
+      and more impactful. Do NOT simply repeat them verbatim.
+    - Each bullet:
+        - Starts with a strong action verb (e.g. "Led", "Designed", "Implemented", "Optimized").
+        - Focuses on responsibilities, achievements, and measurable outcomes.
+        - Is one sentence, clear and concise.
+    - Do NOT invent experience from thin air; every bullet must be supported by the profile or evidence.
+    - Do NOT include numbering, markdown formatting, or additional commentary.
+
+# -------------------------------------------------------------------
+# Education
+# -------------------------------------------------------------------
+education: |
+  Write the education section for a CV as a concise list.
+  You may use one bullet per degree or formatted lines separated by line breaks.
+  For each entry, prioritize the following (when available and relevant):
+    - degree and major,
+    - institution,
+    - location (optional),
+    - years (start–end) or graduation year,
+    - GPA or honors, if they strengthen the profile.
+  Keep the format consistent across entries.
+  Do not add headings like "Education:"; only the entries themselves.
+
+# -------------------------------------------------------------------
+# Training / Certifications
+# -------------------------------------------------------------------
+training: |
+  Write a brief training / courses section as a bulleted list.
+  Each bullet should describe one course, workshop, or training program.
+  When available, include:
+    - the course or training name,
+    - provider or institution,
+    - year or approximate period,
+    - a very short phrase on what was learned or practiced.
+  Do not add a heading; output only the bullets.
+
+certifications: |
+  Write a certifications section as a bulleted list.
+  Each bullet should contain:
+    - the certification name,
+    - issuing organization,
+    - year of award or validity information when useful.
+  Keep each bullet short and consistent.
+  Only include certifications clearly supported by the profile.
+
+# -------------------------------------------------------------------
+# Publications / Projects / Awards / Extracurricular
+# -------------------------------------------------------------------
+publications: |
+  Write the publications section as a bulleted list.
+  Each bullet should describe a single publication, including:
+    - authors (optionally shortened),
+    - title,
+    - venue (journal, conference, or similar),
+    - year.
+  Use a compact citation style that is easy to scan on a CV.
+  Do not add a heading or commentary; only the list of publications.
+
+projects: |
+  Write the projects section as a bulleted list.
+  Each bullet should describe one project and briefly cover:
+    - what was built or analyzed,
+    - the candidate's role,
+    - key technologies or methods,
+    - notable impact or result.
+  Focus on projects that are most relevant to the target role.
+  Keep each bullet to one or two sentences.
+
+awards: |
+  Write the awards and honors section as a bulleted list.
+  Each bullet should include:
+    - the name of the award,
+    - awarding organization or context,
+    - year,
+    - a short phrase on why it was awarded or what it recognizes.
+  List the most important or relevant awards first.
+
+extracurricular: |
+  Write the extracurricular activities section as a bulleted list.
+  Each bullet should describe:
+    - the activity or role,
+    - the organization or context,
+    - key responsibilities or achievements.
+  Focus on leadership, initiative, and impact where possible.
+  Keep each bullet short and outcome-focused.
+
+# -------------------------------------------------------------------
+# References / Additional info / Interests / Volunteering
+# -------------------------------------------------------------------
+references: |
+  Write a brief references section appropriate for a CV.
+  If specific referees are provided in the profile, summarize them in a concise way.
+  If not, use a standard line such as:
+    "References are available upon request."
+  Do not include contact details that are not present in the profile.
+
+additional_info: |
+  Write an additional information section summarizing any extra details that
+  are relevant to the candidate's profile (e.g. languages, availability, relocation, hobbies).
+  Use either a short paragraph or a few bullets.
+  Do not repeat information already clearly covered in other sections unless it improves clarity.
+
+interests: |
+  Write a short list of interests or hobbies as bullets or a simple comma-separated line.
+  Select interests that are professional, constructive, or show positive traits,
+  avoiding anything controversial or overly personal.
+
+volunteering: |
+  Write the volunteering section as a bulleted list.
+  Each bullet should describe:
+    - the volunteer role,
+    - the organization,
+    - the kind of work done,
+    - any notable outcome or contribution.
+  Keep the tone professional and aligned with the target role when possible.

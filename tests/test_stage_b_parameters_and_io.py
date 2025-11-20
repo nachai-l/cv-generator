@@ -9,24 +9,120 @@ Covered here:
 
 - _build_taxonomy_only_fallback
 - _summarize_skills_telemetry
+- _render_experience_header
 """
 
 from __future__ import annotations
 
 import unittest
-from typing import Any, Dict, cast
+from typing import Any, Dict, List, cast, Optional  # 🔹 add List
+from dataclasses import dataclass
 
 import functions.stage_b_generation as stage_b_generation
 from functions.stage_b_generation import (
     _build_taxonomy_only_fallback,
     _summarize_skills_telemetry,
-
+    _render_experience_header,  # 🔹 new import
 )
 from functions.stage_b_generation import CVGenerationEngine
 from .test_stage_b_generation import LoggingTestCase, DummyRequest
 from schemas.input_schema import CVGenerationRequest
 from schemas.internal_schema import SkillsSectionPlan, CanonicalSkill
 from schemas.output_schema import OutputSkillItem
+
+
+# ----------------------------------------------------------------------
+# New tests for _render_experience_header
+# ----------------------------------------------------------------------
+@dataclass
+class ExperienceItem:
+    """Minimal duck-typed experience item used in Stage B tests.
+
+    Only fields actually accessed by Stage B / tests are included.
+    """
+    title: Optional[str]
+    company: Optional[str]
+    start_date: Optional[str]
+    end_date: Optional[str]
+    location: Optional[str]
+    responsibilities: List[str]
+    source: str = "profile"
+
+class TestRenderExperienceHeader(unittest.TestCase):
+    """Unit tests for _render_experience_header helper."""
+
+    def test_full_dict_entry_uses_position_and_years(self) -> None:
+        """position should be preferred over title / job_title."""
+        entry = {
+            "position": "Assistant Manager, Research Division",
+            "title": "Assistant Manager",
+            "job_title": "Research Assistant Manager",
+            "company": "Mitsui Chemicals Singapore R&D Centre",
+            "start_date": "2017-04-01",
+            "end_date": "2023-03-31",
+        }
+
+        header = _render_experience_header(entry)
+
+        expected = (
+            "**Assistant Manager, Research Division**\n"
+            "*Mitsui Chemicals Singapore R&D Centre, 2017–2023*"
+        )
+        self.assertEqual(header, expected)
+
+    def test_dict_entry_without_title_only_company_and_years(self) -> None:
+        """If no title/position/job_title, only company + years line should be returned."""
+        entry = {
+            "company": "Mojia Biotech Pte. Ltd.",
+            "start_date": "2023-01-01",
+            "end_date": None,  # Present
+        }
+
+        header = _render_experience_header(entry)
+
+        expected = "*Mojia Biotech Pte. Ltd., 2023–Present*"
+        self.assertEqual(header, expected)
+
+    def test_missing_dates_does_not_invent_years(self) -> None:
+        """When dates are missing, header should not fabricate years."""
+        entry = {
+            "position": "Senior Researcher",
+            "company": "Example Labs",
+            "start_date": None,
+            "end_date": None,
+        }
+
+        header = _render_experience_header(entry)
+
+        expected = (
+            "**Senior Researcher**\n"
+            "*Example Labs*"
+        )
+        self.assertEqual(header, expected)
+
+    def test_object_like_entry_supported(self) -> None:
+        """Attribute-based entries should work like dict-based ones."""
+        class Obj:
+            def __init__(self) -> None:
+                self.position = "Lead Data Scientist"
+                self.company = "True Digital Group"
+                self.start_date = "2020-01-01"
+                self.end_date = "2022-12-31"
+
+        entry = Obj()
+        header = _render_experience_header(entry)
+
+        expected = (
+            "**Lead Data Scientist**\n"
+            "*True Digital Group, 2020–2022*"
+        )
+        self.assertEqual(header, expected)
+
+
+# ----------------------------------------------------------------------
+# Existing tests (unchanged) …
+# ----------------------------------------------------------------------
+
 
 class TestTaxonomyOnlyFallbackMinimal(unittest.TestCase):
     """Minimal tests for _build_taxonomy_only_fallback."""
@@ -397,6 +493,135 @@ class TestSkillsMatchingEdgeCases(LoggingTestCase):
         finally:
             stage_b_generation.FUZZY_THRESHOLD = original_threshold
             stage_b_generation.MIN_SKILL_COVERAGE = original_cov
+
+class TestExperienceLLMFlow(LoggingTestCase):
+    """Tests for LLM-based experience augmentation and bullets."""
+
+    def test_augment_experience_adds_new_llm_item(self) -> None:
+        """_augment_experience_with_llm should append new items."""
+        # Stub LLM returns one new item in the *normalized* schema
+        fake_json = """
+        {
+          "new_items": [
+            {
+              "title": "Lead AI Engineer",
+              "company": "Example Corp",
+              "start_year": "2022",
+              "end_year": null,
+              "bullets": ["Led AI projects."]
+            }
+          ]
+        }
+        """
+
+        engine = CVGenerationEngine(
+            llm_client=lambda *_a, **_k: fake_json,
+            generation_params={"max_retries": 1},
+        )
+        # Bypass internal retry logic with our stub
+        engine._call_llm_with_retries = (  # type: ignore[assignment]
+            lambda prompt, section_id: fake_json
+        )
+
+        base_items = [
+            ExperienceItem(  # the local test dataclass
+                title="Data Scientist",
+                company="Old Corp",
+                start_date="2020-01-01",
+                end_date="2021-12-31",
+                location="Bangkok",
+                responsibilities=["Did analytics."],
+                source="profile",
+            )
+        ]
+
+        req = DummyRequest(
+            sections=["experience"],
+            language="en",
+            profile_info={"name": "Test User"},
+        )
+        req_typed = cast(CVGenerationRequest, cast(object, req))
+
+        result = engine._augment_experience_with_llm(req_typed, base_items)
+
+        titles = [getattr(it, "title", None) for it in result]
+
+        self.assertIn("Data Scientist", titles)
+        self.assertIn("Lead AI Engineer", titles)
+
+
+    def test_generate_experience_bullets_uses_llm_when_empty(self) -> None:
+        """_generate_experience_bullets_for_item should call LLM when there are no usable responsibilities."""
+        fake_bullets = "- Bullet A\n- Bullet B"
+
+        engine = CVGenerationEngine(
+            llm_client=lambda *_a, **_k: fake_bullets,
+            generation_params={"max_retries": 1},
+        )
+        engine._call_llm_with_retries = (  # type: ignore[assignment]
+            lambda prompt, section_id: fake_bullets
+        )
+
+        item = ExperienceItem(
+            title="AI Engineer",
+            company="Example Corp",
+            start_date="2023-01-01",
+            end_date=None,
+            location="Bangkok",
+            responsibilities=[],  # empty → should use LLM
+            source="profile",
+        )
+
+        req = DummyRequest(
+            sections=["experience"],
+            language="en",
+            profile_info={"name": "Test User"},
+        )
+        req_typed = cast(CVGenerationRequest, cast(object, req))
+
+        bullets = engine._generate_experience_bullets_for_item(req_typed, item)
+
+        self.assertGreaterEqual(len(bullets), 2)
+        for b in bullets:
+            self.assertTrue(b.strip().startswith("-"))
+
+    def test_generate_experience_bullets_skips_llm_when_responsibilities_good(self) -> None:
+        """When responsibilities are already good, LLM should not be required."""
+        def _fail_if_called(*_a: Any, **_k: Any) -> str:
+            raise AssertionError("LLM should not be called for good responsibilities")
+
+        engine = CVGenerationEngine(
+            llm_client=lambda *_a, **_k: "",
+            generation_params={"max_retries": 1},
+        )
+        engine._call_llm_with_retries = _fail_if_called  # type: ignore[assignment]
+
+        item = ExperienceItem(
+            title="Senior Data Scientist",
+            company="Example Corp",
+            start_date="2020-01-01",
+            end_date="2022-12-31",
+            location="Bangkok",
+            responsibilities=[
+                "- Led a team of 5 data scientists to deliver production ML models.",
+                "- Designed and implemented scalable data pipelines for analytics and AI.",
+            ],
+            source="profile",
+        )
+
+        req = DummyRequest(
+            sections=["experience"],
+            language="en",
+            profile_info={"name": "Test User"},
+        )
+        req_typed = cast(CVGenerationRequest, cast(object, req))
+
+        bullets = engine._generate_experience_bullets_for_item(req_typed, item)
+
+        # Should normalize responsibilities into '- ' bullets without raising
+        self.assertGreaterEqual(len(bullets), 2)
+        for b in bullets:
+            self.assertTrue(b.strip().startswith("-"))
 
 if __name__ == "__main__":
     unittest.main()

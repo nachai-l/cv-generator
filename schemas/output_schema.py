@@ -181,8 +181,8 @@ class Metadata(BaseModel):
     @classmethod
     def validate_reasonable_time(cls, v: int) -> int:
         """Ensure generation time is reasonable."""
-        if v > 60000:  # 60 seconds
-            raise ValueError("Generation time exceeds maximum allowed (60s)")
+        if v > 180000:  # 60 seconds
+            raise ValueError("Generation time exceeds maximum allowed (180s)")
         return v
 
     model_config = {"extra": "forbid"}

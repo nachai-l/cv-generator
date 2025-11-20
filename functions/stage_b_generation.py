@@ -86,52 +86,67 @@ from functions.utils.skills_formatting import (
     is_combined_canonical_name,
     match_canonical_skill,
 )
+from functions.utils.experience_functions import (
+    ExperienceItem,
+    extract_year_from_date,
+    render_experience_header,
+    build_structured_experience,
+    render_experience_section_from_structured,
+    normalize_experience_bullets,
+    merge_llm_experience_augmentation,
+    parse_experience_bullets_response,
+)
 from functions.utils.language_tone import describe_language, describe_tone
 from functions.utils.common import resolve_token_budget, load_yaml_dict
 logger = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# Module-level constants (to avoid duplicated long string fragments)
+# Module-level configuration (read parameters.yaml exactly once here)
 # ---------------------------------------------------------------------------
+# Optional tiny cache to avoid recompiling the same regex
+_PROMPTS_CACHE: dict[str, str] | None = None
+PARAMS = load_parameters() or {}
 
-params = load_parameters()
+GENERATION_CFG: Dict[str, Any] = PARAMS.get("generation", {}) or {}
+RETRY_CFG: Dict[str, Any] = GENERATION_CFG.get("retry_thresholds", {}) or {}
+SKILLS_CFG: Dict[str, Any] = GENERATION_CFG.get("skills_matching", {}) or {}
+CORE_SECTIONS: list[str] = PARAMS.get("core_sections", []) or []
+CROSS_SECTION_CFG: Dict[str, Any] = PARAMS.get(
+    "cross_section_evidence_sharing", {}
+) or {}
 
-generation_cfg = params.get("generation", {}) or {}
-retry_cfg = generation_cfg.get("retry_thresholds", {}) or {}
-skills_cfg = generation_cfg.get("skills_matching", {}) or {}
+# ---- Skills / prompts config (from parameters/) ----
+PROMPTS_FILE = GENERATION_CFG.get("prompts_file", "prompts.yaml")
+ALIAS_MAP_FILE = SKILLS_CFG.get("alias_map_file", "alias_mapping.yaml")
 
-# ---- Skills matching config (from parameters.yaml → generation.skills_matching) ----
-_min_cov_raw = skills_cfg.get("min_coverage", 0.6)
+dropping_irrelevant_skills = bool(GENERATION_CFG.get("dropping_irrelevant_skills", True))
+enable_llm_experience = bool(GENERATION_CFG.get("enable_llm_experience", False))
+
+MIN_SECTION_LENGTH = int(RETRY_CFG.get("min_section_length", 10) or 10)
+MIN_RETRY_LENGTH = int(RETRY_CFG.get("retry_short_length", 10) or 10)
+RETRY_SLEEP_MULTIPLIER = float(
+    RETRY_CFG.get("retry_backoff_multiplier", 1.2) or 1.2
+)
+
+# ---- Skills matching numeric thresholds ----
+_min_cov_raw = SKILLS_CFG.get("min_coverage", 0.6)
 try:
     _min_cov = float(_min_cov_raw)
 except (TypeError, ValueError):
     _min_cov = 0.6
 
-MIN_SKILL_COVERAGE = max(0.0, min(1.0, _min_cov))  # clamp to [0, 1]
+MIN_SKILL_COVERAGE = max(0.0, min(1.0, _min_cov))
 
-_raw_fuzzy = skills_cfg.get("fuzzy_threshold")
+_raw_fuzzy = SKILLS_CFG.get("fuzzy_threshold")
 try:
     _fuzzy_val = float(_raw_fuzzy)
-    FUZZY_THRESHOLD = max(0.0, min(1.0, _fuzzy_val))  # clamp to [0, 1]
+    FUZZY_THRESHOLD = max(0.0, min(1.0, _fuzzy_val))
 except (TypeError, ValueError):
     FUZZY_THRESHOLD = None
-
-ALIAS_MAP_FILE = skills_cfg.get("alias_map_file", "alias_mapping.yaml")
-
-dropping_irrelevant_skills = bool(
-    generation_cfg.get("dropping_irrelevant_skills", True)
-)
-
-MIN_SECTION_LENGTH = int(retry_cfg.get("min_section_length", 10) or 10)
-MIN_RETRY_LENGTH = int(retry_cfg.get("retry_short_length", 10) or 10)
-RETRY_SLEEP_MULTIPLIER = float(
-    retry_cfg.get("retry_backoff_multiplier", 1.2) or 1.2
-)
 
 # ---------------------------------------------------------------------------
 # Helper classes / functions
 # ---------------------------------------------------------------------------
-
 
 class _CallableToClientAdapter:
     """
@@ -186,13 +201,18 @@ class _CallableToClientAdapter:
                 prompt_parts.append(str(content))
         prompt = "\n".join(prompt_parts)
 
-        # Dynamic overrides from llm_metrics (e.g. section-level budgets)
+        # Section-specific budget from Stage B (highest priority)
+        section_budget = self._defaults.get("max_output_tokens")
+        # Any max_output_tokens the metrics helper might have passed
         dynamic_max_output = _kwargs.get("max_output_tokens")
-        effective_max_output = (
-            dynamic_max_output
-            if dynamic_max_output is not None
-            else self._defaults.get("max_output_tokens")
-        )
+
+        if section_budget is not None:
+            # 🔹 Always prefer the section token budget when present
+            effective_max_output = int(section_budget)
+        elif dynamic_max_output is not None:
+            effective_max_output = int(dynamic_max_output)
+        else:
+            effective_max_output = self._defaults.get("max_output_tokens")
 
         llm_text_response = self._call(
             prompt,
@@ -205,6 +225,82 @@ class _CallableToClientAdapter:
         )
 
         return self._Resp(llm_text_response)
+
+
+def _extract_training_year(entry):
+    return (
+        extract_year_from_date(getattr(entry, "year", None)) or
+        extract_year_from_date(getattr(entry, "start_date", None)) or
+        extract_year_from_date(getattr(entry, "end_date", None)) or
+        extract_year_from_date(getattr(entry, "training_date", None))
+    )
+
+def _render_experience_header(entry: Any) -> str:
+    """
+    Backwards-compatible wrapper for tests and legacy callers.
+
+    The actual implementation lives in functions.utils.experience_functions
+    as `render_experience_header`.
+    """
+    return render_experience_header(entry)
+
+BAD_SECTION_HEADINGS = (
+    "training",
+    "training section",
+    "publications",
+    "publication",
+    "publications section",
+    "ผลงานตีพิมพ์",
+    "การฝึกอบรม",
+)
+
+def _load_prompts_from_file() -> dict[str, str]:
+    """
+    Load prompts from parameters/prompts.yaml if present, and merge with
+    generation.prompts from parameters.yaml (used heavily in tests).
+
+    Precedence:
+    1. prompts.yaml (file) – highest precedence
+    2. generation.prompts from load_parameters() – used as fallback/override in tests
+    """
+    prompts: dict[str, str] = {}
+
+    # 1) Try parameters/prompts.yaml (or whatever PROMPTS_FILE points to)
+    path = Path(__file__).resolve().parent.parent / "parameters" / PROMPTS_FILE
+    try:
+        cfg = load_yaml_dict(path)
+        # supports both:
+        #   prompts:
+        #     default: "..."
+        # or a root-level dict of prompts
+        candidate = cfg.get("prompts", cfg) if isinstance(cfg, dict) else {}
+        if isinstance(candidate, dict):
+            for k, v in candidate.items():
+                prompts[str(k)] = str(v)
+    except Exception as e:
+        logger.error(
+            "yaml_file_load_error",
+            path=str(path),
+            error=str(e),
+        )
+
+    # 2) Merge generation.prompts from parameters.yaml (tests patch load_parameters())
+    try:
+        params = load_parameters() or {}
+        gen_cfg = params.get("generation", {}) or {}
+        param_prompts = gen_cfg.get("prompts") or {}
+        if isinstance(param_prompts, dict):
+            # Do not overwrite explicit file prompts
+            for k, v in param_prompts.items():
+                prompts.setdefault(str(k), str(v))
+    except Exception as e:
+        logger.warning(
+            "prompts_load_parameters_failed",
+            error=str(e),
+        )
+
+    return prompts
+
 
 def _get_available_sections(request: CVGenerationRequest) -> set[str]:
     """
@@ -297,6 +393,12 @@ def _get_available_sections(request: CVGenerationRequest) -> set[str]:
         if _non_empty(getattr(sp, "additional_info", [])):
             available.add("additional_info")
 
+        if _non_empty(getattr(sp, "projects", [])):
+            available.add("projects")
+
+        if _non_empty(getattr(sp, "certifications", [])):
+            available.add("certifications")
+
     # Structured skills only if we have any skills
     if "skills" in available:
         available.add("skills_structured")
@@ -304,48 +406,85 @@ def _get_available_sections(request: CVGenerationRequest) -> set[str]:
     logger.info("resolved_available_sections", available_sections=list(available))
     return available
 
-
 def _resolve_effective_sections(
     request: CVGenerationRequest,
     available_sections: set[str],
 ) -> list[str]:
     """
-    Decide *which* sections to generate, **strictly honoring template_info.sections_order**.
-    Fallback to request.sections ONLY if the template has no sections_order.
-    Other expansion flags are ignored unless explicitly set in parameters.yaml.
-    """
-    params = load_parameters()
-    gen = params.get("generation", {}) or {}
-    core_sections = params.get("core_sections", []) or []
+    Decide *which* sections to generate, **strictly honoring template_info.sections_order**
+    when configured.
 
-    # Step 1: Determine requested sections from template/request
-    honor_template = bool(gen.get("honor_template_sections_only", True))
-    expand_core = bool(gen.get("expand_to_core", False))
-    enable_structured = bool(gen.get("enable_structured_skills", False))
+    Precedence:
+
+    1. If generation.honor_template_sections_only is True AND template_info.sections_order
+       is non-empty → use template_info.sections_order as the base order.
+    2. Else, if request.sections is provided and non-empty → use request.sections.
+    3. Else, if template_info.sections_order exists → use that.
+    4. Else → fall back to CORE_SECTIONS.
+
+    Then:
+
+    - If generation.expand_to_core is True → union with CORE_SECTIONS (preserving order).
+    - If generation.enable_structured_skills is False → drop "skills_structured".
+    - Finally, filter to sections that are actually in available_sections.
+    """
+    # Pull fresh parameters each time so test patches to load_parameters() take effect
+    params = load_parameters()
+    gen_cfg = params.get("generation", {}) or {}
+
+    honor_template = bool(gen_cfg.get("honor_template_sections_only", False))
+    expand_core = bool(gen_cfg.get("expand_to_core", False))
+    enable_structured = bool(gen_cfg.get("enable_structured_skills", False))
 
     tmpl = getattr(request, "template_info", None)
-    template_order = list(getattr(tmpl, "sections_order", []) or [])
+    template_order: list[str] = list(getattr(tmpl, "sections_order", []) or [])
 
+    # Sections explicitly requested on the API/request
+    explicit_sections: list[str] = list(getattr(request, "sections", None) or [])
+
+    # ------------------------------------------------------------
+    # Step 1: decide the base "requested" order
+    # ------------------------------------------------------------
     if honor_template and template_order:
-        requested = template_order[:]  # STRICT: use template order only
+        # STRICT: use template sections_order and ignore request.sections
+        requested: list[str] = template_order[:]
     else:
-        # Fallback to request.sections if template has no order
-        explicit_sections = (getattr(request, "sections", None) or [])[:]
         if explicit_sections:
             requested = explicit_sections
+        elif template_order:
+            requested = template_order[:]
         else:
-            requested = template_order or core_sections[:] # last-resort fallback
+            # Last-resort fallback: core default sections
+            requested = CORE_SECTIONS[:]
 
-    # Step 2: Apply expansion/filtering rules
+    # ------------------------------------------------------------
+    # Step 2: optional expansion to core sections
+    # ------------------------------------------------------------
     if expand_core:
-        requested = list(dict.fromkeys([*requested, *core_sections]))
+        # Preserve existing order, then append any missing core sections
+        requested = list(dict.fromkeys([*requested, *CORE_SECTIONS]))
 
+    # ------------------------------------------------------------
+    # Step 3: handle structured skills flag
+    # ------------------------------------------------------------
     if not enable_structured:
+        # When structured skills are disabled, drop skills_structured entirely
         requested = [s for s in requested if s != "skills_structured"]
-
-    # Step 3: Filter to only sections with available data
-    # Strict filter: only generate sections that are both requested (by template) AND available
+    if (
+        enable_structured
+        and "skills" in requested
+        and "skills" in available_sections
+        and "skills_structured" in available_sections
+        and "skills_structured" not in requested
+    ):
+        # Order here doesn't matter much because we never render a text section
+        # for skills_structured, but appending is simple and safe.
+        requested.append("skills_structured")
+    # ------------------------------------------------------------
+    # Step 4: filter by available_sections
+    # ------------------------------------------------------------
     effective = [s for s in requested if s in available_sections]
+
     return effective
 
 
@@ -378,35 +517,10 @@ def _get_section_char_limits(request: CVGenerationRequest) -> Dict[str, int]:
         return {}
     return dict(tmpl.max_chars_per_section)
 
-def _extract_year_from_date(value: Any) -> str | None:
-    """Best-effort extraction of a year (YYYY) from a date-like value.
 
-    Accepts:
-    - ISO date strings: '2015-08-01' -> '2015'
-    - datetime/date objects -> str(year)
-    - already-a-year strings -> '2015'
-    """
-    if value is None:
-        return None
-
-    # datetime/date-like
-    try:
-        import datetime as _dt
-
-        if isinstance(value, (_dt.date, _dt.datetime)):
-            return str(value.year)
-    except Exception:
-        # datetime may not be imported or value not a date; ignore
-        pass
-
-    if isinstance(value, str):
-        s = value.strip()
-        if len(s) >= 4 and s[:4].isdigit():
-            return s[:4]
-
-    return None
-
-
+# ---------------------------------------------------------------------------
+# Education section local helper
+# ---------------------------------------------------------------------------
 def _format_education_fact_entry(entry: Any) -> str | None:
     """Format a single education entry into a concise fact string.
 
@@ -431,6 +545,7 @@ def _format_education_fact_entry(entry: Any) -> str | None:
     institution = _get("institution")
     major = _get("major")
     gpa = _get("gpa")
+    honors = _get("honors")
     start_date = _get("start_date")
     graduation_date = _get("graduation_date")
 
@@ -454,9 +569,13 @@ def _format_education_fact_entry(entry: Any) -> str | None:
     if gpa is not None:
         parts.append(f"GPA: {gpa}")
 
+    # Honors / distinctions
+    if honors:
+        parts.append(f"Honors: {honors}")
+
     # Years
-    start_year = _extract_year_from_date(start_date)
-    end_year = _extract_year_from_date(graduation_date)
+    start_year = extract_year_from_date(start_date)
+    end_year = extract_year_from_date(graduation_date)
     if start_year or end_year:
         if start_year and end_year:
             parts.append(f"Years: {start_year}–{end_year}")
@@ -499,6 +618,55 @@ def _collect_education_facts_from_request(request: CVGenerationRequest) -> List[
                     facts.append(fact)
 
     return facts
+
+@lru_cache(maxsize=1)
+def _load_prompts_from_file() -> dict[str, str]:
+    """
+    Load section-level prompts from parameters/prompts.yaml.
+
+    Expected structure (top-level mapping):
+
+        default: |
+          ...
+        profile_summary: |
+          ...
+        skills_structured: |
+          ...
+        experience: |
+          ...
+        experience_bullets_only: |
+          ...
+        user_draft_rewrite_suffix: |
+          ...
+
+    Returns {} on any error.
+    """
+    try:
+        root = Path(__file__).resolve().parents[1]
+        # PROMPTS_FILE is a filename like "prompts.yaml" (from GENERATION_CFG)
+        candidate = root / "parameters" / PROMPTS_FILE
+
+        if not candidate.exists():
+            # Fallback: PROMPTS_FILE might already contain a subpath
+            candidate_alt = root / PROMPTS_FILE
+            if candidate_alt.exists():
+                candidate = candidate_alt
+
+        data = load_yaml_dict(str(candidate)) or {}
+
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("prompts_config_load_failed", error=str(exc))
+        return {}
+
+    if not isinstance(data, dict):
+        logger.warning(
+            "prompts_config_not_mapping",
+            type=str(type(data)),
+        )
+        return {}
+
+    # Ensure keys are strings
+    return {str(k): v for k, v in data.items()}
 
 
 @lru_cache(maxsize=1)
@@ -792,7 +960,6 @@ def _summarize_skills_telemetry(
         "inferred_count": inferred,
     }
 
-
 def _normalize_section_id_for_evidence(section_id: str) -> str:
     """Map internal/derived section IDs to their canonical evidence section name.
 
@@ -846,22 +1013,14 @@ def _collect_evidence_facts_for_section(
 ) -> List[str]:
     """
     Collect evidence facts for a section, *including* any cross-section
-    sharing rules from parameters.yaml.cross_section_evidence_sharing.
-
-    - Always includes the canonical section's own evidence.
-    - If a cross-section rule exists, also pull evidence from those sections.
-    - Special value "all" means "all known sections" from section_hints.
+    sharing rules from CROSS_SECTION_CFG (from parameters.yaml).
     """
     if evidence_plan is None:
         return []
 
     canonical_section_id = _normalize_section_id_for_evidence(section_id)
 
-    # Load cross-section config once per call
-    all_params = load_parameters() or {}
-    cross_cfg: Dict[str, Any] = all_params.get(
-        "cross_section_evidence_sharing", {}
-    ) or {}
+    cross_cfg: Dict[str, Any] = CROSS_SECTION_CFG or {}
 
     # Prefer explicit rule for the actual section_id; fall back to canonical
     cfg_key = section_id if section_id in cross_cfg else canonical_section_id
@@ -942,7 +1101,7 @@ class CVGenerationEngine:
     def __init__(self, llm_client, generation_params: Dict[str, Any] | None = None):
         self.llm_client = llm_client
 
-        file_params = load_parameters().get("generation", {}) or {}
+        file_params = GENERATION_CFG
 
         defaults: Dict[str, Any] = {
             "model": file_params.get("model_name", "gemini-2.5-flash"),
@@ -965,6 +1124,7 @@ class CVGenerationEngine:
         self._metrics_client: _CallableToClientAdapter | None = None
         self._current_user_id: str = "unknown"
         self._last_retry_count: int = 0
+        self._llm_usage_records: list[Dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     # Prompt building
@@ -972,14 +1132,12 @@ class CVGenerationEngine:
 
     @staticmethod
     def _build_section_prompt(
-            request: CVGenerationRequest,
-            evidence_plan: EvidencePlan | None,
-            section_id: str,
+        request: CVGenerationRequest,
+        evidence_plan: EvidencePlan | None,
+        section_id: str,
     ) -> str:
         """Construct an LLM prompt for a single CV section (with full cross-section context)."""
-        all_params = load_parameters()
-        generation_cfg: Dict[str, Any] = all_params.get("generation", {}) or {}
-        prompts_cfg: Dict[str, str] = generation_cfg.get("prompts", {}) or {}
+        prompts_cfg: Dict[str, str] = _load_prompts_from_file()
 
         # 🔹 Resolve language and tone
         raw_language = getattr(request, "language", "en")
@@ -987,9 +1145,9 @@ class CVGenerationEngine:
         language_name = describe_language(language)
 
         tone = (
-                getattr(request, "tone", None)
-                or getattr(request, "style_tone", None)
-                or getattr(getattr(request, "template_info", None), "tone", None)
+            getattr(request, "tone", None)
+            or getattr(request, "style_tone", None)
+            or getattr(getattr(request, "template_info", None), "tone", None)
         )
         tone_desc = describe_tone(tone)
 
@@ -1055,50 +1213,27 @@ class CVGenerationEngine:
             or ["- (No specific evidence provided)"]
         )
 
-
         if user_draft:
             lines.append(f"\n=== User Draft for {section_id} ===")
             draft_text = user_draft if isinstance(user_draft, str) else str(user_draft)
             lines.append(draft_text)
-            lines.append(
-                "\nRewrite the above draft so it is clearer, more concise, and more impactful. "
-                "Do not copy sentences verbatim; rephrase entirely in your own words while preserving factual accuracy. "
-                "Treat this draft as raw information — you may enrich it with relevant details drawn from other sections "
-                "(such as experience, education, or achievements) if it helps improve clarity or flow. "
-                "Maintain a consistent professional tone and ensure the structure matches the expected output format."
-            )
 
-        default_prompt = prompts_cfg.get(
-            "default",
-            (
-                "Write a concise, professional paragraph.\n"
-                "Do not use bullet points or numbering.\n"
-                "Avoid markdown formatting like **bold** or *italics*.\n"
-                "Stay factual and grounded in the details above."
-            ),
+            # Optional suffix from prompts.yaml / parameters
+            draft_suffix = prompts_cfg.get("user_draft_rewrite_suffix", "")
+            if draft_suffix:
+                lines.append("\n" + draft_suffix)
+
+        # 🔹 Append section-specific or default prompt as "Output Requirements"
+        default_prompt = prompts_cfg.get("default") or (
+            "Write this CV section in a clear, concise, and professional style."
         )
-        section_prompt = prompts_cfg.get(section_id, default_prompt)
+        section_prompt = (prompts_cfg.get(section_id) or default_prompt).strip()
 
-        # === Output requirements block ===
-        lines.extend(
-            [
-                "\n=== Output Requirements ===",
-                section_prompt,
-            ]
-        )
-
-        # 🔹 Tie to template's max_chars_per_section
-        char_limits = _get_section_char_limits(request)
-        canonical_section_id = _normalize_section_id_for_evidence(section_id)
-        max_chars = char_limits.get(canonical_section_id)
-
-        if max_chars:
-            lines.append(
-                f"\nIMPORTANT: Your final output for this section must be no longer than "
-                f"{max_chars} characters. Be concise and stay within this limit."
-            )
+        lines.append("\n=== Output Requirements ===")
+        lines.append(section_prompt)
 
         return "\n".join(lines)
+
 
     @staticmethod
     def _build_skills_selection_prompt(
@@ -1113,26 +1248,25 @@ class CVGenerationEngine:
         - Target CV language  → affects naming of inferred skills.
         - Desired tone        → helps the LLM choose appropriate phrasing.
         """
-        params = load_parameters()
-        generation_cfg: Dict[str, Any] = params.get("generation", {}) or {}
-        prompts_cfg: Dict[str, str] = generation_cfg.get("prompts", {}) or {}
+        prompts_cfg: dict[str, str] = _load_prompts_from_file()
+        base_prompt: str = prompts_cfg.get("skills_structured", "")
 
-        if "skills_structured" not in prompts_cfg:
+        if not base_prompt:
             logger.warning(
                 "skills_structured_prompt_missing_using_default",
                 message=(
-                    "generation.prompts.skills_structured not found in parameters.yaml; "
-                    "falling back to built-in default prompt."
+                    "skills_structured not found in prompts.yaml; "
+                    "using a built-in JSON-only prompt instead."
                 ),
             )
-
-        base_prompt: str = prompts_cfg.get(
-            "skills_structured",
-            "",
-        )
-        if len(base_prompt) == 0:
-            raise RuntimeError(
-                f"Fail to load skills_structured prompt from parameters.yaml."
+            base_prompt = (
+                "You are an assistant that selects and structures the candidate's skills.\n"
+                "Return ONLY valid JSON matching this schema:\n"
+                "{\n"
+                '  "items": [\n'
+                '    { "name": string, "level": string | null, "keep": boolean, "source": "taxonomy" | "inferred" }\n'
+                "  ]\n"
+                "}\n"
             )
 
         # 🔹 Resolve language & tone (request.language overrides function arg)
@@ -1212,92 +1346,115 @@ class CVGenerationEngine:
 
     @staticmethod
     def _get_section_token_budget_for_attempt(
-            section_id: str,
-            attempt: int,
+        section_id: str,
+        attempt: int,
     ) -> int | None:
         """
         Compatibility wrapper around the pure resolve_token_budget().
 
-        Loads parameters.yaml once per call and delegates to the pure function.
+        Uses load_parameters() so that tests can monkeypatch it.
+        Falls back to module-level PARAMS if load_parameters() fails.
         """
         try:
             all_params = load_parameters() or {}
         except Exception:
-            return None
+            # Fallback to module-level snapshot
+            try:
+                all_params = PARAMS or {}
+            except Exception:
+                return None
 
         return resolve_token_budget(section_id, attempt, all_params)
-
-
 
     # ------------------------------------------------------------------
     # LLM call with retries (Option C: feature flag for zero-token retry)
     # ------------------------------------------------------------------
     def _call_llm_with_retries(self, prompt: str, section_id: str) -> str:
         """
-        Retry logic that distinguishes:
+        LLM call with retry logic + per-section token budgets.
 
-        - Real Gemini responses:
-            * have real usage metadata with a `raw.usage_metadata` source
-            * may be retried on zero-token or too-short outputs
-        - Mock / unit-test LLM responses:
-            * show total_tokens == 0 and `_source="merged"`
-            * we NEVER retry on zero-tokens here to keep tests deterministic
+        Behaviour:
 
-        Additionally, zero-token retry is controlled via:
-            generation.retry_on_zero_tokens (bool, default: True)
+        - If section_token_budgets are configured, we look up the budget for
+          (section_id, attempt) via _get_section_token_budget_for_attempt.
+          When a budget is found, we create a fresh _CallableToClientAdapter
+          for that attempt with max_output_tokens set to that budget.
 
-        IMPORTANT:
-        - If the underlying llm_client falls back to a STUB_ERROR / API_ERROR text, we NEVER
-          surface that raw stub text in the CV. We log it and treat it as
-          "no output", letting downstream fallbacks / placeholders handle it.
+        - If no budget is found, we fall back to a shared adapter built from
+          self.generation_params.
+
+        - "Real" LLM (non-mock) calls:
+            * may retry on zero-token outputs (if retry_on_zero_tokens=True)
+            * may retry on very short outputs (< MIN_RETRY_LENGTH)
+
+        - "Mock" / unit-test LLM calls (usage._source in {None, "merged"}):
+            * NEVER retry on zero tokens
+            * NEVER retry on short outputs
         """
-        max_retries = int(self.generation_params.get("max_retries", 2))
-        retry_on_zero_tokens = bool(
-            self.generation_params.get("retry_on_zero_tokens", True)
-        )
+
+        params = self.generation_params
+        max_retries = int(params.get("max_retries", 2))
+        retry_on_zero_tokens = bool(params.get("retry_on_zero_tokens", True))
         min_length_threshold = MIN_RETRY_LENGTH
+
         attempt = 0
         last_result: str = ""
-        # reset per top-level generate_cv call; generate_cv sets this as well
         self._last_retry_count = 0
 
         while attempt < max_retries:
             attempt += 1
+
             logger.info(
                 "llm_call_start",
                 attempt=attempt,
-                model=self.generation_params.get("model"),
+                model=params.get("model"),
                 section_id=section_id,
                 stage="B_generation",
             )
 
+            # --------------------------------------------------------------
+            # 1) Per-attempt section token budget
+            # --------------------------------------------------------------
+            max_tokens_for_attempt: int | None = None
             try:
-                # ----- Per-attempt max_output_tokens from section_token_budgets -----
+                # _get_section_token_budget_for_attempt is expected to use the
+                # section_token_budgets config loaded in __init__.
                 max_tokens_for_attempt = self._get_section_token_budget_for_attempt(
                     section_id=section_id,
                     attempt=attempt,
                 )
+            except Exception as e:  # ultra defensive; shouldn't normally happen
+                logger.warning(
+                    "section_token_budget_lookup_failed",
+                    section_id=section_id,
+                    attempt=attempt,
+                    error=str(e),
+                )
+                max_tokens_for_attempt = None
 
-                # Build an adapter for this attempt.
-                # If we have a specific budget, override max_output_tokens; otherwise
-                # fall back to the engine-wide default.
-                if max_tokens_for_attempt is not None:
-                    local_defaults = dict(self.generation_params)
-                    local_defaults["max_output_tokens"] = max_tokens_for_attempt
-                    metrics_client = _CallableToClientAdapter(
-                        self.llm_client, local_defaults
+            if max_tokens_for_attempt is not None:
+                # We have a budget → override max_output_tokens for THIS attempt
+                local_defaults = dict(params)
+                local_defaults["max_output_tokens"] = int(max_tokens_for_attempt)
+                logger.info(
+                    "section_token_budget_applied",
+                    section_id=section_id,
+                    attempt=attempt,
+                    max_output_tokens=int(max_tokens_for_attempt),
+                )
+                metrics_client = _CallableToClientAdapter(self.llm_client, local_defaults)
+            else:
+                # No budget → reuse or create a shared adapter with base params
+                if self._metrics_client is None:
+                    self._metrics_client = _CallableToClientAdapter(
+                        self.llm_client, params
                     )
-                else:
-                    # No per-attempt override → reuse or create a shared adapter
-                    if self._metrics_client is None:
-                        self._metrics_client = _CallableToClientAdapter(
-                            self.llm_client, self.generation_params
-                        )
-                    metrics_client = self._metrics_client
+                metrics_client = self._metrics_client
 
+            try:
                 resp = call_llm_section_with_metrics(
                     llm_client=metrics_client,
-                    model=self.generation_params.get("model"),
+                    model=params.get("model"),
                     prompt=prompt,
                     section_id=section_id,
                     purpose="stage_b_generation",
@@ -1305,13 +1462,14 @@ class CVGenerationEngine:
                     messages=None,
                 )
 
-                # 👇 Always rely on str(resp), NOT resp.text
                 raw_text = str(resp).strip()
 
-                # --- Handle stub / API error text from llm_client safely ----
+                # ----------------------------------------------------------
+                # 2) Handle stub / API error sentinel text
+                # ----------------------------------------------------------
                 is_stub_error = (
-                    raw_text.startswith("[STUB_ERROR:")
-                    or raw_text.startswith("STUB_ERROR:")
+                        raw_text.startswith("[STUB_ERROR:")
+                        or raw_text.startswith("STUB_ERROR:")
                 )
                 is_api_error = raw_text.startswith("[API_ERROR]")
 
@@ -1324,37 +1482,40 @@ class CVGenerationEngine:
                         attempt=attempt,
                     )
 
-                    # Try again if we still have retries left
                     if attempt < max_retries:
                         time.sleep(RETRY_SLEEP_MULTIPLIER * attempt)
                         continue
                     else:
-                        # Out of retries → treat as no output
                         self._last_retry_count = attempt - 1
                         return ""
 
-                # Usage snapshot injected by llm_metrics (if any)
+                # ----------------------------------------------------------
+                # 3) Inspect usage snapshot to detect real vs mock LLM
+                # ----------------------------------------------------------
                 usage = getattr(resp, "_llm_usage_snapshot", None)
                 total_tokens = 0
                 if isinstance(usage, dict):
                     total_tokens = int(usage.get("total_tokens", 0) or 0)
 
-                # Heuristic: distinguish real LLM vs. mocked/unit-test client
                 is_mock_llm = (
-                    usage is None
-                    or (
-                        isinstance(usage, dict)
-                        and usage.get("_source") in (None, "merged")
-                    )
+                        usage is None
+                        or (
+                                isinstance(usage, dict)
+                                and usage.get("_source") in (None, "merged")
+                        )
                 )
 
-                # ------------------------------
-                # REAL LLM: retry on zero tokens
-                # ------------------------------
+                # Track last non-empty text
+                if raw_text:
+                    last_result = raw_text
+
+                # ----------------------------------------------------------
+                # 4) REAL LLM: retry on zero-token output (if enabled)
+                # ----------------------------------------------------------
                 if (
-                    not is_mock_llm
-                    and retry_on_zero_tokens
-                    and total_tokens == 0
+                        not is_mock_llm
+                        and retry_on_zero_tokens
+                        and total_tokens == 0
                 ):
                     logger.warning(
                         "llm_retry_due_to_zero_tokens",
@@ -1372,18 +1533,17 @@ class CVGenerationEngine:
                         self._last_retry_count = attempt - 1
                         return last_result or "[ERROR: LLM returned zero tokens]"
 
-                # For both real + mock clients: remember last non-empty text
-                if raw_text:
-                    last_result = raw_text
-
-                # REAL LLM: retry on very short response
-                if len(raw_text) < min_length_threshold and not is_mock_llm:
+                # ----------------------------------------------------------
+                # 5) REAL LLM: retry on very short output
+                #    (mock LLM never retries on length)
+                # ----------------------------------------------------------
+                if not is_mock_llm and len(raw_text) < min_length_threshold:
                     logger.warning(
                         "llm_result_too_short_retry",
                         attempt=attempt,
                         section_id=section_id,
                         length=len(raw_text),
-                        content_preview=raw_text[:50],
+                        content_preview=raw_text[:80],
                     )
                     if attempt < max_retries:
                         time.sleep(RETRY_SLEEP_MULTIPLIER * attempt)
@@ -1397,7 +1557,9 @@ class CVGenerationEngine:
                         self._last_retry_count = attempt - 1
                         return last_result
 
-                # Success
+                # ----------------------------------------------------------
+                # 6) SUCCESS
+                # ----------------------------------------------------------
                 logger.info(
                     "llm_call_success",
                     attempt=attempt,
@@ -1409,6 +1571,7 @@ class CVGenerationEngine:
                 return raw_text
 
             except (RuntimeError, TimeoutError, ValueError) as exc:
+                # Network/transport/runtime failure; may retry
                 logger.warning(
                     "llm_call_failed_exception",
                     attempt=attempt,
@@ -1430,10 +1593,229 @@ class CVGenerationEngine:
 
                 time.sleep(RETRY_SLEEP_MULTIPLIER * attempt)
 
+        # --------------------------------------------------------------
+        # 7) All attempts exhausted without hard error
+        # --------------------------------------------------------------
         self._last_retry_count = max(attempt - 1, 0)
         return last_result
 
+    # ---------------------------------------------------------------------------
+    # Experience section local helper
+    # ---------------------------------------------------------------------------
+    def _augment_experience_with_llm(
+            self,
+            request: CVGenerationRequest,
+            items: list[ExperienceItem],
+    ) -> list[ExperienceItem]:
+        if not items:
+            return items
 
+        prompts_cfg: dict[str, str] = _load_prompts_from_file()
+        base_style_prompt = prompts_cfg.get("experience", "")
+
+        raw_language = getattr(request, "language", "en") or "en"
+        language_name = describe_language(raw_language)
+
+        tone = (
+                getattr(request, "tone", None)
+                or getattr(request, "style_tone", None)
+                or getattr(getattr(request, "template_info", None), "tone", None)
+        )
+        tone_desc = describe_tone(tone)
+
+        evidence_facts = _collect_evidence_facts_for_section(
+            self._evidence_plan, "experience"
+        )
+
+        raw_profile_info = getattr(request, "profile_info", None)
+        if not raw_profile_info:
+            raw_profile_info = getattr(request, "student_profile", None) or {}
+        profile_info = _to_serializable(raw_profile_info)
+
+        drafts = getattr(request, "user_input_cv_text_by_section", {}) or {}
+        draft_text = drafts.get("experience")
+
+        current_items_payload = [
+            i.__dict__ for i in items  # ExperienceItem is a dataclass
+        ]
+
+        lines: list[str] = [
+            "You are helping to refine the work experience section of a CV.",
+            f"The CV language is {language_name} (language_code='{raw_language}').",
+            f"The overall tone of the CV is {tone_desc}.",
+            "",
+            "=== Profile Info (JSON) ===",
+            json.dumps(profile_info, ensure_ascii=False, indent=2),
+            "",
+            "=== Current experience entries (JSON) ===",
+            json.dumps(current_items_payload, ensure_ascii=False, indent=2),
+        ]
+
+        if draft_text:
+            lines.extend(
+                [
+                    "",
+                    "=== User-provided experience draft (raw text) ===",
+                    str(draft_text),
+                ]
+            )
+
+        if evidence_facts:
+            lines.append("\n=== Evidence facts for experience ===")
+            lines.extend([f"- {fact}" for fact in evidence_facts])
+
+        if base_style_prompt:
+            lines.extend(
+                [
+                    "",
+                    "=== High-level style guide for experience ===",
+                    base_style_prompt,
+                ]
+            )
+
+        lines.extend(
+            [
+                "",
+                "Now, based on all of the information above, suggest any additional",
+                "roles or positions that clearly belong in the candidate's work history",
+                "but are missing from the current list.",
+                "",
+                "Return ONLY valid JSON with this exact structure:",
+                '{ "new_items": [ { ... } ] }',
+                "",
+                'If you have nothing to add, respond with: { "new_items": [] }',
+                "Do NOT include any extra text or markdown.",
+            ]
+        )
+
+        prompt = "\n".join(lines)
+
+        raw_json = self._call_llm_with_retries(
+            prompt,
+            section_id="experience_augment",
+        )
+
+        # 🔸 delegate parsing + dedup to utils
+        return merge_llm_experience_augmentation(items, raw_json)
+
+    def _generate_experience_bullets_for_item(
+            self,
+            request: CVGenerationRequest,
+            item: ExperienceItem,
+            max_bullets: int = 6,
+    ) -> list[str]:
+
+        # Heuristic: treat existing bullets as a fallback (not a shortcut)
+        existing = [b for b in (item.responsibilities or []) if (b or "").strip()]
+        long_enough = [
+            r for r in existing
+            if len(str(r).lstrip("-•* ").strip()) >= 20
+        ]
+        prefer_existing = len(long_enough) >= 2  # just a fallback signal
+
+        # -----------------------------
+        # LLM path (always attempt)
+        # -----------------------------
+        prompts_cfg: dict[str, str] = _load_prompts_from_file()
+        bullets_prompt_template = prompts_cfg.get("experience_bullets_only", "")
+
+        raw_language = getattr(request, "language", "en")
+        if hasattr(raw_language, "value"):
+            raw_language = raw_language.value  # <-- convert enum → "en"
+        language_name = describe_language(raw_language)
+
+        tone = (
+                getattr(request, "tone", None)
+                or getattr(request, "style_tone", None)
+                or getattr(getattr(request, "template_info", None), "tone", None)
+        )
+        tone_desc = describe_tone(tone)
+
+        raw_profile_info = getattr(request, "profile_info", None)
+        if not raw_profile_info:
+            raw_profile_info = getattr(request, "student_profile", None) or {}
+        profile_info = _to_serializable(raw_profile_info)
+
+        evidence_facts = _collect_evidence_facts_for_section(
+            self._evidence_plan, "experience"
+        )
+
+        drafts = getattr(request, "user_input_cv_text_by_section", {}) or {}
+        draft_text = drafts.get("experience")
+
+        item_payload = item.__dict__
+
+        lines = [
+            "You are generating bullet points for a single work experience entry in a CV.",
+            f"The CV language is {language_name}.",
+            f"The overall tone of the CV is {tone_desc}.",
+            "",
+            "=== Profile Info (JSON) ===",
+            json.dumps(profile_info, ensure_ascii=False, indent=2),
+            "",
+            "=== Experience item (JSON) ===",
+            json.dumps(item_payload, ensure_ascii=False, indent=2),
+        ]
+
+        if draft_text:
+            lines.extend([
+                "",
+                "=== User-provided experience draft (raw text) ===",
+                str(draft_text),
+            ])
+
+        if evidence_facts:
+            lines.append("\n=== Evidence facts for experience ===")
+            lines.extend([f"- {fact}" for fact in evidence_facts])
+
+        if bullets_prompt_template:
+            lines.extend([
+                "",
+                "=== Instructions for responsibility bullets ===",
+                bullets_prompt_template,
+            ])
+
+        prompt = "\n".join(lines)
+
+        raw_text = self._call_llm_with_retries(
+            prompt,
+            section_id="experience_bullets",
+        )
+
+        # Try parser first
+        bullets = parse_experience_bullets_response(
+            raw_text,
+            existing_responsibilities=existing,
+            max_bullets=max_bullets,
+        )
+
+        # 🔹 If parser failed but LLM clearly returned bullet lines, extract them manually
+        if not bullets and raw_text:
+            candidate_lines = []
+            for ln in raw_text.splitlines():
+                stripped = ln.strip()
+                if not stripped:
+                    continue
+                if stripped.startswith(("-", "•", "*")):
+                    # Normalize to "- "
+                    candidate_lines.append(
+                        "- " + stripped.lstrip("-•* ").strip()
+                    )
+
+            if candidate_lines:
+                bullets = candidate_lines[:max_bullets]
+
+        if bullets:
+            return bullets
+
+        # Fallback to existing bullets if they were "good"
+        if prefer_existing:
+            return normalize_experience_bullets(existing, max_bullets=max_bullets)
+
+        # Last-resort stub
+        return [
+            "- Role responsibilities were not fully provided; details are available upon request."
+        ]
 
     # ------------------------------------------------------------------
     # Structured skills generation
@@ -1697,8 +2079,7 @@ class CVGenerationEngine:
         profile_info = getattr(request, "profile_info", None)
 
         # Clamp generation time
-        all_params = load_parameters()
-        gen_cfg = all_params.get("generation", {}) or {}
+        gen_cfg = GENERATION_CFG
         max_time_ms = int(gen_cfg.get("max_generation_time_ms", 60_000))
 
         raw_time_ms = generation_time_ms or 0
@@ -1754,12 +2135,26 @@ class CVGenerationEngine:
     # Public API
     # ------------------------------------------------------------------
     def generate_cv(
-            self,
-            request: CVGenerationRequest,
-            evidence_plan: EvidencePlan | None = None,
-            skills_plan: SkillsSectionPlan | None = None,
+        self,
+        request: CVGenerationRequest,
+        evidence_plan: EvidencePlan | None = None,
+        skills_plan: SkillsSectionPlan | None = None,
     ) -> CVGenerationResponse:
-        """Generate CV sections end-to-end."""
+        """
+        Generate all CV sections end-to-end for Stage B.
+
+        Responsibilities:
+        - Bind request-scoped logging context (request_id, user_id, template_id, etc.)
+        - Resolve which sections are effectively generated based on template + request
+        - Generate structured skills first (when enabled) and render text skills from them
+        - Call the LLM for all remaining sections with retry + truncation
+        - Apply section-specific post-processing:
+            * experience: deterministic header + bullet list per role
+            * training: append year hint when missing
+            * training/publications: strip meaningless heading bullets
+        - Emit telemetry for skills and overall Stage B performance
+        - Build a CVGenerationResponse with all generated sections and metadata.
+        """
         # ------------------------------------------------------------
         # Bind request-scoped structured logging context
         # ------------------------------------------------------------
@@ -1768,9 +2163,9 @@ class CVGenerationEngine:
             job_id=getattr(request, "job_id", None) or "N/A",
             user_id=getattr(request, "user_id", "unknown"),
             template_id=(
-                    getattr(getattr(request, "template_info", None), "template_id", None)
-                    or getattr(request, "template_id", None)
-                    or "UNKNOWN_TEMPLATE"
+                getattr(getattr(request, "template_info", None), "template_id", None)
+                or getattr(request, "template_id", None)
+                or "UNKNOWN_TEMPLATE"
             ),
             language=getattr(request, "language", "en"),
             sections_count=len(getattr(request, "sections", []) or []),
@@ -1785,7 +2180,9 @@ class CVGenerationEngine:
             available_sections = _get_available_sections(request)
 
             # Resolve strictly based on template order
-            effective_sections = _resolve_effective_sections(request, available_sections)
+            effective_sections = _resolve_effective_sections(
+                request, available_sections
+            )
 
             logger.info(
                 "stage_b_resolved_sections",
@@ -1835,6 +2232,105 @@ class CVGenerationEngine:
                 if section_id == "skills_structured":
                     continue
 
+                # ------------------------------------------------------------------
+                # NEW: Experience uses structured-first path with NO LLM call
+                # ------------------------------------------------------------------
+                if section_id == "experience":
+                    # 1) Build base structured experience from profile / student_profile / drafts
+                    structured_items = build_structured_experience(request)
+
+                    # If we have nothing structured, fall back to LLM section generation
+                    if not structured_items:
+                        raw_text = self._call_llm_with_retries(
+                            self._build_section_prompt(
+                                request,
+                                evidence_plan,
+                                section_id,
+                            ),
+                            section_id,
+                        )
+                        truncated = _truncate_text(
+                            raw_text or "",
+                            char_limits.get("experience"),
+                        )
+                        text_for_section = truncated or ""
+                        if len(text_for_section.strip()) < MIN_SECTION_LENGTH:
+                            text_for_section = build_section_fallback_text(
+                                request,
+                                section_id,
+                                reason="LLM output empty for experience",
+                            )
+
+                        generated_sections[section_id] = SectionContent(
+                            text=text_for_section,
+                            word_count=len(text_for_section.split()),
+                            matched_jd_skills=[],
+                            confidence_score=1.0,
+                        )
+                        continue
+
+                    items: list[ExperienceItem] = structured_items
+
+                    # 2) Optionally augment with LLM (new roles) if feature flag enabled
+                    if enable_llm_experience:
+                        try:
+                            items = self._augment_experience_with_llm(request, items)
+                        except Exception as exc:  # pragma: no cover
+                            logger.warning(
+                                "experience_augmentation_failed",
+                                error=str(exc),
+                            )
+
+                    # 3) Ensure bullets for each item (LLM per-role when needed)
+                    for item in items:
+                        try:
+                            new_bullets = self._generate_experience_bullets_for_item(
+                                request,
+                                item,
+                                max_bullets=6,
+                            )
+                            item.responsibilities = new_bullets
+                            item.bullets = new_bullets
+                        except Exception as exc:  # pragma: no cover
+                            logger.warning(
+                                "experience_bullets_generation_failed",
+                                error=str(exc),
+                                title=item.title,
+                                company=item.company,
+                            )
+                            # Fallback using normalized bullets from utils
+                            item.responsibilities = normalize_experience_bullets(
+                                item.responsibilities or []
+                            ) or [
+                                "- Role responsibilities were not fully provided; details are available upon request."
+                            ]
+
+                    # 4) Deterministic markdown rendering
+                    section_text = render_experience_section_from_structured(items)
+                    section_text = _truncate_text(
+                        section_text,
+                        char_limits.get("experience"),
+                    )
+
+                    if len((section_text or "").strip()) < MIN_SECTION_LENGTH:
+                        section_text = build_section_fallback_text(
+                            request,
+                            section_id,
+                            reason="experience text too short",
+                        )
+
+                    generated_sections[section_id] = SectionContent(
+                        text=section_text,
+                        word_count=len(section_text.split()),
+                        matched_jd_skills=[],
+                        confidence_score=1.0,
+                    )
+                    continue
+
+
+                # ------------------------------------------------------------------
+                # Special handling: skills text rendered from structured-first output
+                # ------------------------------------------------------------------
                 if section_id == "skills" and structured_first and skills_output is not None:
                     text_for_section = format_plain_skill_bullets(skills_output)
                     text_for_section = _truncate_text(
@@ -1856,6 +2352,9 @@ class CVGenerationEngine:
                         )
 
                 else:
+                    # --------------------------------------------------------------
+                    # Default generation path for all other sections (LLM-backed)
+                    # --------------------------------------------------------------
                     raw_text = self._call_llm_with_retries(
                         self._build_section_prompt(request, evidence_plan, section_id),
                         section_id,
@@ -1879,17 +2378,24 @@ class CVGenerationEngine:
                             reason="LLM output empty",
                         )
 
+                    # Legacy mode: derive structured skills from free-text "skills"
                     if (
-                            section_id == "skills"
-                            and not structured_first
-                            and skills_plan is not None
-                            and skills_output is None
+                        section_id == "skills"
+                        and not structured_first
+                        and skills_plan is not None
+                        and skills_output is None
                     ):
                         try:
                             skills_output = self._generate_structured_skills(
                                 request,
                                 skills_plan,
                                 skills_section_text=text_for_section,
+                            )
+                            logger.warning(
+                                "skills_structured_generation fallback to legacy!",
+                                section_id=section_id,
+                                length=len(text_for_section),
+                                reason="Failed to generate structured skills",
                             )
                         except Exception as exc:
                             logger.error(
@@ -1898,12 +2404,46 @@ class CVGenerationEngine:
                             )
                             skills_output = _build_taxonomy_only_fallback(skills_plan)
 
+                # ------------------------------------------------------------------
+                # Post-processing hooks for specific sections (non-experience)
+                # ------------------------------------------------------------------
+
+                # Training: append year hint from first training entry if missing
+                if section_id == "training":
+                    sp = getattr(request, "student_profile", None)
+                    trainings = getattr(sp, "training", []) if sp else []
+                    if trainings:
+                        yr = _extract_training_year(trainings[0])
+                        if yr and yr not in text_for_section:
+                            lines = text_for_section.splitlines()
+                            if lines:
+                                lines[-1] = lines[-1].rstrip() + f" ({yr})"
+                                text_for_section = "\n".join(lines)
+
+                # Remove meaningless heading bullets for training/publications
+                if section_id in ("training", "publications"):
+                    lines = text_for_section.splitlines()
+                    cleaned: list[str] = []
+                    for ln in lines:
+                        core = (
+                            ln.strip()
+                              .lstrip("-•* ")
+                              .rstrip(":")
+                              .strip()
+                              .lower()
+                        )
+                        if core in BAD_SECTION_HEADINGS:
+                            continue
+                        cleaned.append(ln)
+                    text_for_section = "\n".join(cleaned).strip()
+
                 generated_sections[section_id] = SectionContent(
                     text=text_for_section,
                     word_count=len(text_for_section.split()),
                     matched_jd_skills=[],
                     confidence_score=1.0,
                 )
+
 
             elapsed_ms = int((time.monotonic() - start_time) * 1000)
 
@@ -1912,7 +2452,9 @@ class CVGenerationEngine:
                     "skills_before_reconcile",
                     skills=[(s.name, s.level, s.source) for s in skills_output],
                 )
-                skills_output = _reconcile_skill_levels_with_request(request, skills_output)
+                skills_output = _reconcile_skill_levels_with_request(
+                    request, skills_output
+                )
                 logger.info(
                     "skills_after_reconcile",
                     skills=[(s.name, s.level, s.source) for s in skills_output],

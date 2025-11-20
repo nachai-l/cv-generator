@@ -31,6 +31,25 @@ from difflib import SequenceMatcher
 
 from schemas.output_schema import OutputSkillItem
 from schemas.internal_schema import CanonicalSkill
+import re
+
+_WORD_BOUNDARY_CACHE: dict[str, re.Pattern[str]] = {}
+
+def _contains_word_case_insensitive(text: str, word: str) -> bool:
+    """
+    Return True if `word` appears as a full word in `text` (case-insensitive).
+    Prevents cases like canonical='Java' matching 'JavaScript'.
+    """
+    if not word:
+        return False
+
+    key = word.strip().lower()
+    pat = _WORD_BOUNDARY_CACHE.get(key)
+    if pat is None:
+        pat = re.compile(rf"\b{re.escape(key)}\b", re.IGNORECASE)
+        _WORD_BOUNDARY_CACHE[key] = pat
+
+    return pat.search(text) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +222,10 @@ def match_canonical_skill(
         if not key:
             continue
 
+        # Prevent false positives (Java vs JavaScript)
+        if key in lowered and not _contains_word_case_insensitive(lowered, key):
+            continue
+
         canon_tokens = _normalize_skill_tokens(key)
         if not canon_tokens:
             continue
@@ -238,6 +261,9 @@ def match_canonical_skill(
 
             similarity = SequenceMatcher(None, lowered, key).ratio()
             if similarity >= fuzzy_threshold and similarity > best_similarity:
+                # extra guard for Java vs JavaScript
+                if key in lowered and not _contains_word_case_insensitive(lowered, key):
+                    continue
                 best_similarity = similarity
                 best_canon = canon
 

@@ -255,6 +255,79 @@ class GuardrailsProcessor:
             # Best-effort only; failure here must not break the request.
             pass
 
+        # NEW: normalize experience from student_profile into profile_info
+        try:
+            exp_list = getattr(student_profile, "experience", None) or []
+            if exp_list:
+                normalized_exps: list[Dict[str, Any]] = []
+                for exp in exp_list:
+                    title = (
+                        getattr(exp, "title", None)
+                        or getattr(exp, "position", None)
+                        or getattr(exp, "role", None)
+                    )
+
+                    company = (
+                        getattr(exp, "company", None)
+                        or getattr(exp, "organization", None)
+                        or getattr(exp, "employer", None)
+                    )
+
+                    start_date = (
+                        getattr(exp, "start_date", None)
+                        or getattr(exp, "startDate", None)
+                    )
+                    end_date = (
+                        getattr(exp, "end_date", None)
+                        or getattr(exp, "endDate", None)
+                    )
+
+                    responsibilities = (
+                        getattr(exp, "responsibilities", None)
+                        or getattr(exp, "highlights", None)
+                        or getattr(exp, "description", None)
+                        or []
+                    )
+
+                    # Normalize responsibilities to a list of strings
+                    if isinstance(responsibilities, (str, bytes)):
+                        responsibilities_list = (
+                            [responsibilities.strip()]
+                            if str(responsibilities).strip()
+                            else []
+                        )
+                    elif isinstance(responsibilities, (list, tuple)):
+                        responsibilities_list = [
+                            str(r).strip()
+                            for r in responsibilities
+                            if r is not None and str(r).strip()
+                        ]
+                    else:
+                        responsibilities_list = (
+                            [str(responsibilities).strip()]
+                            if responsibilities and str(responsibilities).strip()
+                            else []
+                        )
+
+                    normalized_exps.append(
+                        {
+                            "title": title,
+                            # duplicate into 'position' for robustness with existing code
+                            "position": title,
+                            "company": company,
+                            "start_date": start_date,
+                            "end_date": end_date,
+                            "responsibilities": responsibilities_list,
+                        }
+                    )
+
+                profile_info["experience"] = normalized_exps
+        except Exception:
+            logger.debug(
+                "normalize_request_shape_experience_attach_failed",
+                exc_info=True,
+            )
+
         # Attach without fighting pydantic's extra="forbid"
         try:
             if isinstance(request, BaseModel):
@@ -269,6 +342,7 @@ class GuardrailsProcessor:
             )
 
         return request
+
 
     # -------------------------------------------------------------------------
     # Public API
@@ -501,10 +575,36 @@ class GuardrailsProcessor:
         education_ids: List[str] = []
         for idx, edu in enumerate(getattr(profile, "education", []) or []):
             edu_id = getattr(edu, "id", None) or f"education_{idx}"
-            fact = f"Holds {getattr(edu, 'degree', '')} from {getattr(edu, 'institution', '')}".strip()
-            if getattr(edu, "gpa", None) is not None:
-                fact += f" (GPA: {edu.gpa})"
-            evidences.append(Evidence(evidence_id=edu_id, fact=fact, source_type="education"))
+
+            degree = getattr(edu, "degree", "")
+            institution = getattr(edu, "institution", "")
+            gpa = getattr(edu, "gpa", None)
+            honors = getattr(edu, "honors", None)  # 👈 NEW (safe even if field absent)
+
+            fact_parts: list[str] = []
+            if degree or institution:
+                fact_parts.append(f"Holds {degree} from {institution}".strip())
+
+            details: list[str] = []
+            if gpa is not None:
+                details.append(f"GPA: {gpa}")
+            if honors:
+                details.append(f"Honors: {honors}")
+
+            if details:
+                fact_parts.append(f"({', '.join(details)})")
+
+            fact = " ".join(fact_parts).strip()
+            if not fact:
+                continue
+
+            evidences.append(
+                Evidence(
+                    evidence_id=edu_id,
+                    fact=fact,
+                    source_type="education",
+                )
+            )
             education_ids.append(edu_id)
 
         # Education (drafts)
@@ -513,13 +613,55 @@ class GuardrailsProcessor:
             for idx, edu in enumerate(draft_education):
                 if not isinstance(edu, dict):
                     continue
+
                 edu_id = f"education_draft_{idx}"
+
                 degree = edu.get("degree", "")
                 inst = edu.get("institution", "")
                 loc = edu.get("location", "")
-                fact = f"User draft education: {degree} at {inst}".strip()
+                gpa = edu.get("gpa")
+                honors = edu.get("honors")
+                start = edu.get("start_date")
+                end = edu.get("graduation_date")
+
+                fact_parts: list[str] = []
+                if degree or inst:
+                    base = f"User draft education: {degree} at {inst}".strip()
+                    fact_parts.append(base)
                 if loc:
-                    fact += f" in {loc}"
+                    fact_parts.append(f"in {loc}")
+
+                details: list[str] = []
+                if gpa is not None:
+                    details.append(f"GPA: {gpa}")
+                if honors:
+                    details.append(f"Honors: {honors}")
+
+                # Extract year (start/end may be ISO strings)
+                def _get_year(x):
+                    if not x: return None
+                    try:
+                        return x[:4] if isinstance(x, str) else str(x.year)
+                    except Exception:
+                        return None
+
+                start_y = _get_year(start)
+                end_y = _get_year(end)
+                if start_y or end_y:
+                    if start_y and end_y:
+                        details.append(f"Years: {start_y}–{end_y}")
+                    elif start_y:
+                        details.append(f"Years: {start_y}–")
+                    else:
+                        details.append(f"Years: –{end_y}")
+
+                if details:
+                    fact_parts.append("(" + ", ".join(details) + ")")
+
+                fact = " ".join(fact_parts).strip()
+                if not fact:
+                    continue
+
                 evidences.append(
                     Evidence(
                         evidence_id=edu_id,
@@ -528,6 +670,7 @@ class GuardrailsProcessor:
                     )
                 )
                 education_ids.append(edu_id)
+
 
         if education_ids:
             section_hints["education"] = education_ids

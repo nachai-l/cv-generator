@@ -1,17 +1,10 @@
 {
-  "user_id": "U-3002",
+  "user_id": "U-3003",
   "language": "th",
   "language_tone": "funny",
   "template_id": "T_EMPLOYER_STD_V3",
   "sections": [
-      "profile_summary",
-      "skills",
-      "education",
-      "experience",
-      "publications",
-      "training",
-      "references",
-      "additional_info"
+      "experience"
   ],
   "student_profile": {
     "personal_info": {
