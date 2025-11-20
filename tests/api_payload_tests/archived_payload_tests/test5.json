@@ -2,9 +2,8 @@
   "user_id": "U-3001",
   "language": "en",
   "language_tone": "funny",
-  "template_info": {
-    "template_id": "T_EMPLOYER_STD_V3",
-    "sections_order": [
+  "template_id": "T_EMPLOYER_STD_V3",
+  "sections": [
       "profile_summary",
       "skills",
       "experience",
@@ -12,8 +11,7 @@
       "training",
       "references",
       "additional_info"
-    ]
-  },
+  ],
   "student_profile": {
     "personal_info": {
       "name": "Somchai Chinnawong",

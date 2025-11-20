@@ -110,6 +110,24 @@ _LEVEL_LABELS: dict[str, str] = {
     "L4_Expert": "Expert",
 }
 
+def _parse_bullet_lines(content: str) -> list[str]:
+    """
+    Extract a clean list of text items from a multiline or bullet-style section.
+
+    Handles lines beginning with '-', '•', or '*', ignores empty lines, and strips whitespace.
+    """
+    if not content:
+        return []
+    items: list[str] = []
+    for ln in content.replace("\r\n", "\n").split("\n"):
+        ln = ln.strip()
+        if not ln:
+            continue
+        if ln.startswith(("-", "•", "*")):
+            ln = ln.lstrip("-•*").strip()
+        items.append(ln)
+    return items
+
 
 def skill_level_label(level: str | None) -> str:
     """Map internal level codes like 'L4_Expert' to nice display labels."""
@@ -399,45 +417,111 @@ def _format_section_content(section_name: str, content: str) -> str:
 
     # ---------------- EXPERIENCE ----------------
     if section_name == "experience":
-        # Blocks are separated by blank lines
-        blocks = [blk.strip() for blk in content.split("\n\n") if blk.strip()]
-        html_blocks: list[str] = []
+        # State machine parser over lines:
+        #   **Job Title**
+        #   *Company, 2020–2024*
+        #   - Bullet 1
+        #   - Bullet 2
+        #
+        # Also supports older shape:
+        #   *Company, 2020–2022*
+        #   - Bullet 1
+        #   - Bullet 2
+        raw_lines = [
+            ln.strip()
+            for ln in content.replace("\r\n", "\n").split("\n")
+        ]
 
-        for blk in blocks:
-            blk_lines = [l for l in blk.split("\n") if l.strip()]
-            if not blk_lines:
+        jobs: list[dict[str, Any]] = []
+        current: dict[str, Any] | None = None
+
+        def flush_current() -> None:
+            nonlocal current
+            if current and (current["title"] or current["company"] or current["bullets"]):
+                jobs.append(current)
+            current = None
+
+        for ln in raw_lines:
+            if not ln:
                 continue
 
-            title = _strip_md(blk_lines[0])
-            meta = ""
-            bullet_lines: list[str] = []
+            # New job title
+            if ln.startswith("**") and ln.endswith("**"):
+                flush_current()
+                current = {
+                    "title": _strip_md(ln),
+                    "company": "",
+                    "bullets": [],
+                }
+                continue
 
-            # Second line often is *Company, Years*
-            if len(blk_lines) > 1 and blk_lines[1].lstrip().startswith("*"):
-                meta = _strip_md(blk_lines[1])
-                rest = blk_lines[2:]
+            # Company + dates (italic)
+            if ln.startswith("*") and ln.endswith("*"):
+                text = _strip_md(ln)
+                if current is None:
+                    # Company-only block (no explicit title)
+                    current = {
+                        "title": "",
+                        "company": text,
+                        "bullets": [],
+                    }
+                elif not current["company"]:
+                    current["company"] = text
+                else:
+                    current["bullets"].append(text)
+                continue
+
+            # Bullet / responsibility line
+            if ln.startswith(("-", "•")):
+                bullet = ln.lstrip("-•").strip()
+                if current is None:
+                    current = {
+                        "title": "",
+                        "company": "",
+                        "bullets": [],
+                    }
+                current["bullets"].append(bullet)
+                continue
+
+            # Fallback: plain text → treat as extra bullet or title-only job
+            if current is None:
+                current = {
+                    "title": ln,
+                    "company": "",
+                    "bullets": [],
+                }
             else:
-                rest = blk_lines[1:]
+                current["bullets"].append(ln)
 
-            for l in rest:
-                l_stripped = l.strip()
-                if l_stripped.startswith(("-", "•")):
-                    bullet_lines.append(l_stripped.lstrip("-•").strip())
-                elif l_stripped:
-                    bullet_lines.append(l_stripped)
+        flush_current()
+
+        html_blocks: list[str] = []
+        for job in jobs:
+            title_html = ""
+            meta_html = ""
+
+            if job["title"]:
+                title_html = f'<div class="item-title">{job["title"]}</div>'
+                if job["company"]:
+                    meta_html = f'<div class="item-meta">{job["company"]}</div>'
+            elif job["company"]:
+                # No explicit title → show company+years as title line
+                title_html = f'<div class="item-title">{job["company"]}</div>'
 
             bullets_html = ""
-            if bullet_lines:
-                bullets_html = "<ul class=\"item-bullets\">" + "".join(
-                    f"<li>{re.escape(b) if False else b}</li>" for b in bullet_lines
-                ) + "</ul>"
+            if job["bullets"]:
+                bullets_html = (
+                    '<ul class="item-bullets">'
+                    + "".join(f"<li>{b}</li>" for b in job["bullets"])
+                    + "</ul>"
+                )
 
             html_blocks.append(
                 f"""
                 <div class="experience-item">
                     <div class="item-header">
-                        <div class="item-title">{title}</div>
-                        <div class="item-meta">{meta}</div>
+                        {title_html}
+                        {meta_html}
                     </div>
                     {bullets_html}
                 </div>
@@ -445,6 +529,7 @@ def _format_section_content(section_name: str, content: str) -> str:
             )
 
         return "".join(html_blocks)
+
 
     # ---------------- EDUCATION ----------------
     if section_name == "education":
@@ -498,6 +583,20 @@ def _format_section_content(section_name: str, content: str) -> str:
             + "</ul>"
         )
 
+    # ---------------- PUBLICATIONS / TRAINING / REFERENCES / ADDITIONAL INFO ----------------
+    if section_name in {"publications", "training", "references", "additional_info"}:
+        # Treat as simple stacked bullet list.
+        # Any heading lines like "### ..." will be ignored because they
+        # don't start with '-' or '•'.
+        items = _parse_bullet_lines(content)
+        if not items:
+            return ""
+        return (
+            '<ul class="stacked-list">'
+            + "".join(f"<li>{item}</li>" for item in items)
+            + "</ul>"
+        )
+
     # ---------------- INTERESTS ----------------
     if section_name == "interests":
         # Build inline pills, similar to skills
@@ -511,34 +610,6 @@ def _format_section_content(section_name: str, content: str) -> str:
             for item in items
         )
         return f'<ul class="inline-list">{pills}</ul>'
-
-    # ---------------- PROJECTS / EXTRACURRICULAR / VOLUNTEERING ----------------
-    if section_name in {"projects", "extracurricular", "volunteering"}:
-        # Simple: treat as bullet list when lines start with '-'
-        bullets: list[str] = []
-        paragraphs: list[str] = []
-        for ln in lines:
-            ln_stripped = ln.strip()
-            if not ln_stripped:
-                continue
-            if ln_stripped.startswith(("-", "•")):
-                bullets.append(ln_stripped.lstrip("-•").strip())
-            else:
-                paragraphs.append(ln_stripped)
-
-        html_parts: list[str] = []
-
-        if paragraphs:
-            for para in "\n".join(paragraphs).split("\n\n"):
-                if para.strip():
-                    html_parts.append(f"<p>{para.strip()}</p>")
-
-        if bullets:
-            html_parts.append(
-                "<ul>" + "".join(f"<li>{b}</li>" for b in bullets) + "</ul>"
-            )
-
-        return "".join(html_parts)
 
     # ---------------- DEFAULT (any other section) ----------------
     # Just split double newlines into paragraphs

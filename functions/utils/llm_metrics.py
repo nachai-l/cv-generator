@@ -1436,6 +1436,9 @@ def call_llm_section_with_metrics(
 
         usage_snapshot = dict(merged)
         usage_snapshot["_source"] = src
+        usage_snapshot["input_cost_usd"] = input_cost_usd
+        usage_snapshot["output_cost_usd"] = output_cost_usd
+        usage_snapshot["total_cost_usd"] = total_cost_usd
 
     except (AttributeError, TypeError, ValueError) as e:
         logger.debug("llm_metrics_usage_snapshot_build_failed", error=str(e))

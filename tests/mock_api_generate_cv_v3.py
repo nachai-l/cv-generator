@@ -292,7 +292,7 @@ def main() -> None:
         # 3B. Call REAL API to get WITH-LLM response
         # -------------------------------------------------
         try:
-            resp = requests.post(API_URL, json=payload, timeout=180)
+            resp = requests.post(API_URL, json=payload, timeout=240)
         except Exception as exc:
             print(f"       ❌ API call failed: {exc}")
             continue

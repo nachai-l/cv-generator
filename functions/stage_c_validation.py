@@ -386,6 +386,79 @@ def _matches_any_pattern(text: str, patterns: Iterable[str]) -> bool:
     return False
 
 
+def _strip_leading_markdown_headers(text: str) -> str:
+    """
+    Remove leading markdown headings like '#', '##', '###' and pure bold
+    heading lines such as '**References**' or '**บุคคลอ้างอิง**' that
+    the LLM sometimes adds at the very top of a section.
+    """
+    if not text:
+        return text
+
+    lines = text.splitlines()
+    idx = 0
+
+    while idx < len(lines):
+        line = lines[idx].strip()
+        if not line:
+            idx += 1
+            continue
+
+        # '# Heading', '## Heading', etc.
+        if line.startswith("#"):
+            idx += 1
+            continue
+
+        # Pure bold heading line: '**something**'
+        if line.startswith("**") and line.endswith("**") and len(line) > 4:
+            idx += 1
+            continue
+
+        break
+
+    return "\n".join(lines[idx:]).lstrip("\n")
+
+
+def _strip_markdown_bullet_prefixes(text: str) -> str:
+    """
+    For sections where the Jinja template already renders bullets,
+    strip markdown-style bullet prefixes ('* ' or '- ') to avoid
+    nested bullets like '* หลักสูตร ...'.
+    """
+    if not text:
+        return text
+
+    cleaned_lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.lstrip()
+        if line.startswith("* ") or line.startswith("- "):
+            line = line[2:]
+        cleaned_lines.append(line)
+
+    return "\n".join(cleaned_lines).strip()
+
+
+def _clean_section_markdown(section_id: str, text: str) -> str:
+    """
+    Apply markdown cleanup rules per section.
+
+    - Always remove LLM-added leading headings / bold headings.
+    - For sections where the template already provides bullets,
+      remove explicit bullet prefixes.
+    """
+    if not text:
+        return text
+
+    text = _strip_leading_markdown_headers(text)
+
+    # These sections are rendered as bullet lists by the template;
+    # we don't want extra '* ' / '- ' from the LLM.
+    if section_id in {"publications", "training", "references", "additional_info"}:
+        text = _strip_markdown_bullet_prefixes(text)
+
+    return text
+
+
 def _sanitize_sections(
     *,
     sections: Dict[str, Any],
@@ -473,8 +546,32 @@ def _sanitize_sections(
                 _append_metadata_warning(resp, msg)
                 logger.warning("stage_c_section_suspicious", section_id=section_id)
 
+        # Normalize markdown artifacts (headings, extra bullets)
+        text = _clean_section_markdown(section_id, text)
+
         # Basic cleaning
         text = _clean_text(text, enable_cleaning)
+
+        # Strip redundant headings like 'Publications', 'Training',
+        # Section-specific cleanup: drop bullets that are just headings
+        if section_id in ("training", "publications"):
+            lines = text.splitlines()
+            cleaned_lines: list[str] = []
+            for line in lines:
+                stripped = line.strip()
+                # remove leading bullet symbols for the check
+                core = stripped.lstrip("-•").strip().lower()
+                if core in {
+                    "training",
+                    "publications",
+                    "ผลงานตีพิมพ์",   # Thai: publications
+                    "การฝึกอบรม",     # Thai: training
+                }:
+                    # skip pure-heading bullet
+                    continue
+                cleaned_lines.append(line)
+            text = "\n".join(cleaned_lines).strip()
+            text = _strip_leading_section_heading(section_id, text)
 
         # Only drop sections that are TRULY empty after cleaning
         if not text.strip() and drop_empty:
@@ -505,6 +602,12 @@ def _sanitize_sections(
         if text != orig_text:
             # Update section object
             sec_obj.text = text
+            # Best-effort: refresh word_count if the field exists
+            if hasattr(sec_obj, "word_count"):
+                try:
+                    sec_obj.word_count = len(text.split())
+                except Exception:
+                    pass
 
         cleaned[section_id] = sec_obj
 
@@ -512,6 +615,43 @@ def _sanitize_sections(
 
 
 _SECTION_MULTI_BLANK_RE = re.compile(r"\n{3,}")
+def _strip_leading_section_heading(section_id: str, text: str) -> str:
+    """
+    Remove a redundant first line like 'Publications', 'Training',
+    'ผลงานตีพิมพ์', 'การฝึกอบรม', etc., which Gemini sometimes adds
+    inside the section body.
+    """
+    if not text:
+        return text
+
+    lines = text.splitlines()
+    if not lines:
+        return text
+
+    first = lines[0].strip(" -*•\t")
+
+    # English headings
+    en_map = {
+        "publications": ["Publications"],
+        "training": ["Training"],
+        "references": ["References"],
+    }
+
+    # Thai headings we already see in your examples
+    th_map = {
+        "publications": ["ผลงานตีพิมพ์"],
+        "training": ["การฝึกอบรม"],
+        "references": ["บุคคลอ้างอิง", "**บุคคลอ้างอิง**"],
+    }
+
+    candidates = (en_map.get(section_id, []) +
+                  th_map.get(section_id, []))
+
+    if any(first.lower() == c.lower().strip("*") for c in candidates):
+        # Drop the first line and trim leading whitespace
+        return "\n".join(lines[1:]).lstrip()
+
+    return text
 
 
 def _clean_text(text: str, enable_cleaning: bool) -> str:
@@ -539,6 +679,7 @@ def _clean_text(text: str, enable_cleaning: bool) -> str:
 
     # Strip leading/trailing whitespace & quotes artifacts
     text = text.strip(" \t\n\r\"'")
+
 
     return text
 

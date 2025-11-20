@@ -113,6 +113,7 @@ class Education(BaseModel):
     start_date: date
     graduation_date: date | None
     major: str | None = Field(None, max_length=200)
+    honors: str | None = Field(None, max_length=200)
 
     @model_validator(mode="after")
     def validate_dates(self) -> "Education":
