@@ -22,6 +22,36 @@ logger = structlog.get_logger().bind(module="utils.common")
 # Root of project (two dirs up from utils/)
 ROOT = Path(__file__).resolve().parents[2]
 
+# ---------------------------------------------------------------------------
+# yaml reader
+# ---------------------------------------------------------------------------
+
+def load_yaml_dict(path: Path) -> Dict[str, Any]:
+    """
+    Safely load a YAML file into a dict.
+    Returns {} on any failure (missing file, parse error, wrong type).
+    """
+    try:
+        if not path.exists():
+            logger.info("yaml_file_missing", path=str(path))
+            return {}
+        with path.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        if not isinstance(data, dict):
+            logger.warning(
+                "yaml_file_not_dict",
+                path=str(path),
+                type=str(type(data))
+            )
+            return {}
+        return data
+    except Exception as e:  # pragma: no cover
+        logger.exception(
+            "yaml_file_load_error",
+            path=str(path),
+            error=str(e)
+        )
+        return {}
 
 # ---------------------------------------------------------------------------
 # Pydantic helpers (v1 / v2)
@@ -162,6 +192,44 @@ def select_llm_client_and_params() -> Tuple[Any, Dict[str, Any]]:
         return dummy_llm_client, engine_params
 
 # ---------------------------------------------------------------------------
+# token budget selection based on section and params
+# ---------------------------------------------------------------------------
+
+def resolve_token_budget(section_id: str, attempt: int, params: dict) -> int | None:
+    """
+    Pure function for determining max_output_tokens for a given section+attempt.
+
+    Inputs:
+        section_id : str
+        attempt    : int (1-based)
+        params     : dict loaded from parameters.yaml
+
+    Behaviour:
+        - Looks at params["section_token_budgets"]
+        - Accepts scalar (int) or list/tuple per section
+        - Clamps attempt to last item for lists
+        - Falls back to "default" if section-specific entry not found
+    """
+    budgets_cfg = (params.get("section_token_budgets") or {}).copy()
+    raw = budgets_cfg.get(section_id, budgets_cfg.get("default"))
+
+    if raw is None:
+        return None
+
+    if isinstance(raw, int):
+        return raw if raw > 0 else None
+
+    if isinstance(raw, (list, tuple)) and raw:
+        idx = max(0, min(attempt - 1, len(raw) - 1))
+        try:
+            val = int(raw[idx])
+            return val if val > 0 else None
+        except Exception:
+            return None
+
+    return None
+
+# ---------------------------------------------------------------------------
 
 __all__ = [
     "model_validate_compat",
@@ -172,4 +240,6 @@ __all__ = [
     "select_llm_client_and_params",
     "ensure_llm_metrics_env",
     "load_yaml_file",
+    "resolve_token_budget",
+    "load_yaml_dict",
 ]

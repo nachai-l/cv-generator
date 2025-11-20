@@ -161,6 +161,22 @@ class Metadata(BaseModel):
         description="Original profile_info payload used for header/contact rendering",
     )
 
+    # 🔹 Correlation id for this generation (aligned with Stage D request_id)
+    request_id: str | None = Field(
+        default=None,
+        description="Request correlation ID (mirrors Stage D request_id when available).",
+    )
+
+    # 🔹 Pipeline flags – set by Stage C and Stage D respectively
+    stage_c_validated: bool = Field(
+        default=False,
+        description="True once Stage C validation has run successfully.",
+    )
+    stage_d_completed: bool = Field(
+        default=False,
+        description="True once Stage D packaging has completed successfully.",
+    )
+
     @field_validator("generation_time_ms")
     @classmethod
     def validate_reasonable_time(cls, v: int) -> int:

@@ -136,10 +136,6 @@ def _text_from_student_profile_section(
 
 
 def build_wo_llm_response(payload: Dict[str, Any]) -> "CVGenerationResponse":
-    """
-    Build a CVGenerationResponse *without* calling the API/LLM.
-    Uses only student_profile and requested sections.
-    """
     from schemas.output_schema import (
         CVGenerationResponse,
         SectionContent,
@@ -150,10 +146,22 @@ def build_wo_llm_response(payload: Dict[str, Any]) -> "CVGenerationResponse":
     )
 
     student_profile = payload.get("student_profile")
-    template_id = payload.get("template_id", "UNKNOWN_TEMPLATE")
+    template_info = payload.get("template_info") or {}
+
+    # Prefer top-level, fall back to template_info
+    template_id = payload.get("template_id") or template_info.get("template_id", "UNKNOWN_TEMPLATE")
     language = payload.get("language", "en")
     user_id = payload.get("user_id", "UNKNOWN_USER")
-    sections_requested = payload.get("sections") or []
+
+    # Prefer explicit sections; otherwise use template_info.sections_order
+    sections_requested = payload.get("sections")
+    if not sections_requested:
+        sections_requested = template_info.get("sections_order") or []
+    # Defensive: ensure list of strings
+    if not isinstance(sections_requested, list):
+        sections_requested = []
+    else:
+        sections_requested = [str(s) for s in sections_requested]
 
     # ---- Build sections from student_profile ----
     sections_dict: Dict[str, SectionContent] = {}
@@ -207,6 +215,9 @@ def build_wo_llm_response(payload: Dict[str, Any]) -> "CVGenerationResponse":
         tokens_used=0,
         cost_estimate_thb=0.0,
         profile_info=student_profile,
+        request_id=f"REQ_wo_llm_{user_id}",
+        stage_c_validated=True,
+        stage_d_completed=True,
     )
 
     justification = Justification.model_construct()

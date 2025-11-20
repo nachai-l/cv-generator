@@ -8,6 +8,46 @@ This module handles:
 - Calling the LLM with retry logic
 - Applying character limits
 - Returning a CVGenerationResponse compliant with schemas/output_schema.py
+
+
+STRUCTURED-FIRST vs LEGACY skills modes
+---------------------------------------
+
+Stage B supports two behaviours for the "skills" family of sections:
+
+1) STRUCTURED-FIRST mode  (recommended)
+   - Trigger: "skills_structured" is present in `effective_sections`.
+   - Flow:
+       a) Build a SkillsSectionPlan from the request profile/student_profile.
+       b) Call the LLM once for "skills_structured" to generate JSON skills
+          (taxonomy + inferred), with full evidence and job-context prompts.
+       c) Render the human-readable "skills" section text from the structured
+          skills output (bullet list), then apply per-section char limits.
+   - Guarantees:
+       - Canonical/taxonomy skills always keep their original levels.
+       - Any canonical skill that disappears from the LLM output is re-added.
+       - A final reconciliation step restores original levels for any
+         canonical skill names present in the output.
+
+2) LEGACY mode  (backwards-compatible)
+   - Trigger: "skills_structured" is NOT in `effective_sections`.
+   - Flow:
+       a) Generate the free-text "skills" section like any other section.
+       b) Optionally derive structured skills by parsing the generated bullets.
+       c) If parsing fails, fall back to taxonomy-only structured skills.
+   - Guarantees:
+       - The same reconciliation rules apply: any skill whose name matches a
+         canonical skill gets its level forced back to the canonical value.
+       - Taxonomy-only fallback is used as a last resort if the LLM output is
+         unusable.
+
+Shared invariants across both modes:
+- Structured skills are always the source of truth for levels.
+- The free-text "skills" section is either:
+    - rendered from structured skills (STRUCTURED-FIRST), or
+    - used as a hint to construct structured skills (LEGACY).
+- In all cases, canonical skills from the incoming request must never be
+  silently downgraded or lose their original level.
 """
 
 from __future__ import annotations
@@ -15,8 +55,11 @@ from __future__ import annotations
 import json
 import time
 from typing import Any, Dict, List, Union
+from pathlib import Path
+from functools import lru_cache
 
 import structlog
+from structlog.contextvars import bind_contextvars, clear_contextvars
 from pydantic import BaseModel
 
 from schemas.input_schema import CVGenerationRequest
@@ -37,52 +80,53 @@ from schemas.output_schema import (
 from functions.utils.llm_client import load_parameters
 from functions.utils.llm_metrics import call_llm_section_with_metrics
 from functions.utils.fallbacks import build_section_fallback_text
-
+from functions.utils.skills_formatting import (
+    format_plain_skill_bullets,
+    parse_skills_from_bullets,
+    is_combined_canonical_name,
+    match_canonical_skill,
+)
+from functions.utils.language_tone import describe_language, describe_tone
+from functions.utils.common import resolve_token_budget, load_yaml_dict
 logger = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Module-level constants (to avoid duplicated long string fragments)
 # ---------------------------------------------------------------------------
 
-DEFAULT_SKILLS_STRUCTURED_PROMPT = (
-    'You are helping to prepare the "skills" section of a CV.\n\n'
-    "You are given:\n"
-    "- A list of existing skills from our controlled taxonomy (canonical skills).\n"
-    "- You may also add new skills freely, based on the provided evidence context.\n\n"
-    "IMPORTANT RULES:\n"
-    "1. You MUST NOT rename, paraphrase, or otherwise change any existing skill name.\n"
-    "2. You MUST preserve the exact level value (e.g., L4_Expert, L3_Advanced, L2_Intermediate) for all existing taxonomy skills. Do NOT modify, downgrade, or change these level values.\n"  # ← ADD THIS
-    "3. You may reorder skills to optimize relevance for the target role.\n"
-    "4. You may remove skills that are less relevant by setting \"keep\": false.\n"
-    "5. You may add new skills that are clearly supported by the candidate's experience, profile, or projects.\n"
-    "6. Keep skill names concise (2–5 words). Avoid overly broad or vague terms.\n"
-    "7. When in doubt, keep existing skills and add only meaningful new ones.\n\n"
-    "Return ONLY valid JSON with this exact structure:\n"
-    "{\n"
-    "  \"items\": [\n"
-    "    {\n"
-    "      \"name\": \"string\",\n"
-    "      \"level\": \"string or null\",\n"
-    "      \"keep\": true,\n"
-    "      \"source\": \"taxonomy|inferred\"\n"
-    "    },\n"
-    "    ...\n"
-    "  ]\n"
-    "}\n\n"
-    "Do not include any explanatory text, comments, or markdown — output JSON only."
+params = load_parameters()
+
+generation_cfg = params.get("generation", {}) or {}
+retry_cfg = generation_cfg.get("retry_thresholds", {}) or {}
+skills_cfg = generation_cfg.get("skills_matching", {}) or {}
+
+# ---- Skills matching config (from parameters.yaml → generation.skills_matching) ----
+_min_cov_raw = skills_cfg.get("min_coverage", 0.6)
+try:
+    _min_cov = float(_min_cov_raw)
+except (TypeError, ValueError):
+    _min_cov = 0.6
+
+MIN_SKILL_COVERAGE = max(0.0, min(1.0, _min_cov))  # clamp to [0, 1]
+
+_raw_fuzzy = skills_cfg.get("fuzzy_threshold")
+try:
+    _fuzzy_val = float(_raw_fuzzy)
+    FUZZY_THRESHOLD = max(0.0, min(1.0, _fuzzy_val))  # clamp to [0, 1]
+except (TypeError, ValueError):
+    FUZZY_THRESHOLD = None
+
+ALIAS_MAP_FILE = skills_cfg.get("alias_map_file", "alias_mapping.yaml")
+
+dropping_irrelevant_skills = bool(
+    generation_cfg.get("dropping_irrelevant_skills", True)
 )
 
-# Treat these as the canonical “core bundle” only when explicitly enabled
-CORE_SECTIONS = [
-    "profile_summary",
-    "skills",
-    "experience",
-    "education",
-    "certifications",
-    "awards",
-    "projects",
-    "interests",
-]
+MIN_SECTION_LENGTH = int(retry_cfg.get("min_section_length", 10) or 10)
+MIN_RETRY_LENGTH = int(retry_cfg.get("retry_short_length", 10) or 10)
+RETRY_SLEEP_MULTIPLIER = float(
+    retry_cfg.get("retry_backoff_multiplier", 1.2) or 1.2
+)
 
 # ---------------------------------------------------------------------------
 # Helper classes / functions
@@ -205,6 +249,10 @@ def _get_available_sections(request: CVGenerationRequest) -> set[str]:
         "extracurricular": "extracurricular",
         "volunteering": "volunteering",
         "interests": "interests",
+        "publications": "publications",
+        "training": "training",
+        "references": "references",
+        "additional_info": "additional_info",
     }
 
     for section_id, key in profile_key_map.items():
@@ -237,6 +285,18 @@ def _get_available_sections(request: CVGenerationRequest) -> set[str]:
         if _non_empty(getattr(sp, "extracurriculars", [])):
             available.add("extracurricular")
 
+        if _non_empty(getattr(sp, "publications", [])):
+            available.add("publications")
+
+        if _non_empty(getattr(sp, "training", [])):
+            available.add("training")
+
+        if _non_empty(getattr(sp, "references", [])):
+            available.add("references")
+
+        if _non_empty(getattr(sp, "additional_info", [])):
+            available.add("additional_info")
+
     # Structured skills only if we have any skills
     if "skills" in available:
         available.add("skills_structured")
@@ -256,8 +316,9 @@ def _resolve_effective_sections(
     """
     params = load_parameters()
     gen = params.get("generation", {}) or {}
+    core_sections = params.get("core_sections", []) or []
 
-    # Defaults keep behavior conservative (no auto-expansion)
+    # Step 1: Determine requested sections from template/request
     honor_template = bool(gen.get("honor_template_sections_only", True))
     expand_core = bool(gen.get("expand_to_core", False))
     enable_structured = bool(gen.get("enable_structured_skills", False))
@@ -273,14 +334,16 @@ def _resolve_effective_sections(
         if explicit_sections:
             requested = explicit_sections
         else:
-            requested = template_order or CORE_SECTIONS[:]  # last-resort fallback
+            requested = template_order or core_sections[:] # last-resort fallback
 
+    # Step 2: Apply expansion/filtering rules
     if expand_core:
-        requested = list(dict.fromkeys([*requested, *CORE_SECTIONS]))
+        requested = list(dict.fromkeys([*requested, *core_sections]))
 
     if not enable_structured:
         requested = [s for s in requested if s != "skills_structured"]
 
+    # Step 3: Filter to only sections with available data
     # Strict filter: only generate sections that are both requested (by template) AND available
     effective = [s for s in requested if s in available_sections]
     return effective
@@ -314,6 +377,61 @@ def _get_section_char_limits(request: CVGenerationRequest) -> Dict[str, int]:
     if not tmpl or not getattr(tmpl, "max_chars_per_section", None):
         return {}
     return dict(tmpl.max_chars_per_section)
+
+
+@lru_cache(maxsize=1)
+def _load_skills_alias_map() -> dict[str, str]:
+    """Load skills alias mapping from parameters/alias_mapping.yaml (or override)."""
+    try:
+        root = Path(__file__).resolve().parents[1]
+        alias_path = root / "parameters" / ALIAS_MAP_FILE
+
+        if not alias_path.exists():
+            logger.warning(
+                "skills_alias_map_file_not_found",
+                path=str(alias_path),
+                message="Using empty alias map",
+            )
+            return {}
+
+        data = load_yaml_dict(alias_path) or {}
+
+        if not isinstance(data, dict):
+            logger.warning(
+                "skills_alias_map_root_not_dict",
+                path=str(alias_path),
+                type=str(type(data)),
+            )
+            return {}
+
+        raw = data.get("alias_map", {})
+        if not isinstance(raw, dict):
+            logger.warning(
+                "skills_alias_map_not_dict",
+                path=str(alias_path),
+                type=str(type(raw)),
+            )
+            return {}
+
+        cleaned: dict[str, str] = {}
+        for k, v in raw.items():
+            k_norm = str(k).strip().lower()
+            v_norm = str(v).strip().lower()
+            if not k_norm or not v_norm:
+                logger.debug("skills_alias_empty_entry", key=k, value=v)
+                continue
+            cleaned[k_norm] = v_norm
+
+        logger.info(
+            "skills_alias_map_loaded",
+            path=str(alias_path),
+            alias_count=len(cleaned),
+        )
+        return cleaned
+
+    except Exception as exc:
+        logger.exception("skills_alias_map_load_failed", error=str(exc))
+        return {}
 
 
 def _build_skills_plan_from_profile(request: CVGenerationRequest) -> SkillsSectionPlan | None:
@@ -401,10 +519,36 @@ def _build_skills_plan_from_profile(request: CVGenerationRequest) -> SkillsSecti
     # Nothing usable
     return None
 
+def _build_taxonomy_only_fallback(skills_plan: SkillsSectionPlan) -> list[OutputSkillItem]:
+    """
+    Last-resort fallback: return taxonomy skills unchanged.
+
+    Used when:
+    - The LLM returns invalid/empty JSON for skills_structured
+    - The bullet-list fallback also fails
+    - Structured skills generation errors out
+
+    Always preserves the original canonical levels.
+    """
+    return [
+        OutputSkillItem(
+            name=sk.name,
+            level=sk.level,
+            source="taxonomy",
+        )
+        for sk in skills_plan.canonical_skills
+    ]
+
 def _extract_original_skill_levels(request: CVGenerationRequest) -> dict[str, str]:
     """
-    Collect original skill levels from the incoming request so we can
-    hard-override whatever the LLM suggests.
+    Collect original skill levels from the incoming request.
+
+    We normalise all skills into a dict keyed by lowercased skill name so that
+    later stages (_reconcile_skill_levels_with_request) can restore the original
+    levels and prevent the LLM from silently downgrading or changing them.
+
+    Returns:
+        dict[str, str]: mapping { skill_name_lower: level_string }
     """
     levels: dict[str, str] = {}
 
@@ -418,6 +562,7 @@ def _extract_original_skill_levels(request: CVGenerationRequest) -> dict[str, st
                     name = item.get("name")
                     level = item.get("level")
                 else:
+                    # Simple string skill: we cannot infer a level, so skip.
                     name = str(item)
                     level = None
                 if not name or not level:
@@ -436,6 +581,7 @@ def _extract_original_skill_levels(request: CVGenerationRequest) -> dict[str, st
             level = getattr(sp_skill, "level", None)
             if not name or level is None:
                 continue
+            # Enum levels → use `.value`
             if hasattr(level, "value"):
                 level = level.value
             key = str(name).strip().lower()
@@ -453,18 +599,25 @@ def _reconcile_skill_levels_with_request(
     skills_output: list[OutputSkillItem] | None,
 ) -> list[OutputSkillItem] | None:
     """
-    Final safety net: for any skill whose name matches the original profile
-    (case-insensitive), force the level to match the original profile level.
+    Restore canonical levels for any skills that already existed in the request.
 
-    This guarantees that:
-      - Existing skills NEVER have their levels downgraded/changed by the LLM.
-      - Only truly new inferred skills keep LLM-proposed levels (or None).
+    This is the *last line of defence* to ensure that:
+      - Existing skills NEVER have their levels changed by the LLM.
+      - Only truly new inferred skills keep their LLM-proposed levels (or None).
+
+    Args:
+        request: Original CVGenerationRequest containing profile/student skills.
+        skills_output: Final structured skills list about to be returned.
+
+    Returns:
+        The same list, but with levels corrected for any matching skills.
     """
     if not skills_output:
         return skills_output
 
     original_levels = _extract_original_skill_levels(request)
     if not original_levels:
+        # Nothing to reconcile against.
         return skills_output
 
     for item in skills_output:
@@ -474,9 +627,11 @@ def _reconcile_skill_levels_with_request(
         key = str(name).strip().lower()
         orig_level = original_levels.get(key)
         if orig_level:
-            old_level = item.level  # Add this
+            old_level = item.level
+            # Force level back to original profile/taxonomy value.
             item.level = orig_level
-            # Add this logging:
+
+            # Log whenever we correct an LLM-proposed level.
             if old_level != orig_level:
                 logger.info(
                     "skill_level_reconciled",
@@ -486,6 +641,34 @@ def _reconcile_skill_levels_with_request(
                 )
 
     return skills_output
+
+def _summarize_skills_telemetry(
+    skills_output: list[OutputSkillItem] | None,
+) -> dict[str, Any]:
+    """
+    Build a lightweight telemetry snapshot for structured skills.
+
+    Metrics:
+    - total_skills: total number of skills in the final list
+    - taxonomy_count: skills with source == "taxonomy"
+    - inferred_count: skills with source != "taxonomy"
+    """
+    if not skills_output:
+        return {
+            "total_skills": 0,
+            "taxonomy_count": 0,
+            "inferred_count": 0,
+        }
+
+    total = len(skills_output)
+    taxonomy = sum(1 for s in skills_output if getattr(s, "source", None) == "taxonomy")
+    inferred = total - taxonomy
+
+    return {
+        "total_skills": total,
+        "taxonomy_count": taxonomy,
+        "inferred_count": inferred,
+    }
 
 
 def _normalize_section_id_for_evidence(section_id: str) -> str:
@@ -539,76 +722,89 @@ def _collect_evidence_facts_for_section(
     evidence_plan: EvidencePlan | None,
     section_id: str,
 ) -> List[str]:
+    """
+    Collect evidence facts for a section, *including* any cross-section
+    sharing rules from parameters.yaml.cross_section_evidence_sharing.
+
+    - Always includes the canonical section's own evidence.
+    - If a cross-section rule exists, also pull evidence from those sections.
+    - Special value "all" means "all known sections" from section_hints.
+    """
     if evidence_plan is None:
         return []
 
-    evidence_facts: List[str] = []
     canonical_section_id = _normalize_section_id_for_evidence(section_id)
 
-    # Preferred API: EvidencePlan.get_evidence_for_section(section_id)
+    # Load cross-section config once per call
+    all_params = load_parameters() or {}
+    cross_cfg: Dict[str, Any] = all_params.get(
+        "cross_section_evidence_sharing", {}
+    ) or {}
+
+    # Prefer explicit rule for the actual section_id; fall back to canonical
+    cfg_key = section_id if section_id in cross_cfg else canonical_section_id
+    share_from = cross_cfg.get(cfg_key, cross_cfg.get("default", [])) or []
+
+    sections_to_pull: set[str] = {canonical_section_id}
+
+    # If "all" is present, we will expand to all known sections below
+    use_all = "all" in share_from
+    if not use_all:
+        for src in share_from:
+            if isinstance(src, str) and src:
+                sections_to_pull.add(src)
+
+    evidence_facts: List[str] = []
+    seen_ids: set[str] = set()
+
+    # ---------------------------
+    # Preferred API path
+    # ---------------------------
     if hasattr(evidence_plan, "get_evidence_for_section"):
-        for ev in evidence_plan.get_evidence_for_section(canonical_section_id) or []:
-            fact = getattr(ev, "fact", None)
-            if fact:
-                evidence_facts.append(fact)
+        # If "all" → include every section we know about
+        if use_all:
+            hints = getattr(evidence_plan, "section_hints", {}) or {}
+            for sec in hints.keys():
+                sections_to_pull.add(sec)
+
+        for sec in sections_to_pull:
+            for ev in evidence_plan.get_evidence_for_section(sec) or []:
+                ev_id = getattr(ev, "evidence_id", None)
+                if ev_id and ev_id in seen_ids:
+                    continue
+                if ev_id:
+                    seen_ids.add(ev_id)
+                fact = getattr(ev, "fact", None)
+                if fact:
+                    evidence_facts.append(fact)
+
         return evidence_facts
 
+    # ---------------------------
     # Fallback: manual wiring via section_hints + evidences
-    if hasattr(evidence_plan, "section_hints") and hasattr(evidence_plan, "evidences"):
-        params = load_parameters()
-        cross_cfg: Dict[str, Any] = params.get("cross_section_evidence_sharing", {}) or {}
+    # ---------------------------
+    hints = getattr(evidence_plan, "section_hints", {}) or {}
+    evidences = getattr(evidence_plan, "evidences", []) or []
 
-        hints = getattr(evidence_plan, "section_hints", {}) or {}
-        evidences = getattr(evidence_plan, "evidences", []) or []
+    # Start with canonical; hints may already contain it
+    ids_for_section = set(hints.get(canonical_section_id, []))
 
-        ids_for_section = set(hints.get(canonical_section_id, []))
-
-        # 🔧 NEW: prefer explicit config for the *actual* section_id if present
-        cfg_key = section_id if section_id in cross_cfg else canonical_section_id
-        share_from = cross_cfg.get(cfg_key, cross_cfg.get("default", [])) or []
-
-        shared_ids: List[str] = []
-        if "all" in share_from:
-            for ev in evidences:
-                ev_id = getattr(ev, "evidence_id", None)
-                if ev_id:
-                    shared_ids.append(ev_id)
-        else:
-            for src_section in share_from:
-                shared_ids.extend(hints.get(src_section, []))
-
-        if shared_ids:
-            ids_for_section.update(shared_ids)
-
+    if use_all:
         for ev in evidences:
             ev_id = getattr(ev, "evidence_id", None)
-            fact = getattr(ev, "fact", None)
-            if ev_id in ids_for_section and fact:
-                evidence_facts.append(fact)
+            if ev_id:
+                ids_for_section.add(ev_id)
+    else:
+        for src_section in share_from:
+            ids_for_section.update(hints.get(src_section, []))
+
+    for ev in evidences:
+        ev_id = getattr(ev, "evidence_id", None)
+        fact = getattr(ev, "fact", None)
+        if ev_id in ids_for_section and fact:
+            evidence_facts.append(fact)
 
     return evidence_facts
-
-
-def _extract_skills_from_bullet_text(text: str) -> list[str]:
-    """Simple parser: pull skill phrases from a bullet-list skills section."""
-    if not text:
-        return []
-    skills: list[str] = []
-    for line in text.splitlines():
-        raw = line.strip()
-        if not raw:
-            continue
-        # Strip common bullet markers
-        if raw and raw[0] in "-*•":
-            raw = raw[1:].strip()
-        if not raw:
-            continue
-        # Drop trailing period if present
-        if raw.endswith("."):
-            raw = raw[:-1].rstrip()
-        if raw:
-            skills.append(raw)
-    return skills
 
 
 # ---------------------------------------------------------------------------
@@ -654,14 +850,26 @@ class CVGenerationEngine:
 
     @staticmethod
     def _build_section_prompt(
-        request: CVGenerationRequest,
-        evidence_plan: EvidencePlan | None,
-        section_id: str,
+            request: CVGenerationRequest,
+            evidence_plan: EvidencePlan | None,
+            section_id: str,
     ) -> str:
         """Construct an LLM prompt for a single CV section (with full cross-section context)."""
-        params = load_parameters()
-        generation_cfg: Dict[str, Any] = params.get("generation", {}) or {}
+        all_params = load_parameters()
+        generation_cfg: Dict[str, Any] = all_params.get("generation", {}) or {}
         prompts_cfg: Dict[str, str] = generation_cfg.get("prompts", {}) or {}
+
+        # 🔹 Resolve language and tone
+        raw_language = getattr(request, "language", "en")
+        language = raw_language or "en"
+        language_name = describe_language(language)
+
+        tone = (
+                getattr(request, "tone", None)
+                or getattr(request, "style_tone", None)
+                or getattr(getattr(request, "template_info", None), "tone", None)
+        )
+        tone_desc = describe_tone(tone)
 
         # Legacy-style fields (may be dicts or models); we normalize them
         raw_profile_info = getattr(request, "profile_info", None)
@@ -685,11 +893,12 @@ class CVGenerationEngine:
             evidence_plan, section_id
         )
 
-        language = getattr(request, "language", "en")
-
         lines: List[str] = [
             "You are an expert CV writer.",
-            f"Generate a strong '{section_id}' section in {language} for the candidate below.",
+            f"The CV language is {language_name} (language_code='{language}').",
+            f"The overall tone of the CV is {tone_desc}.",
+            "",
+            f"Generate a strong '{section_id}' section in {language_name} for the candidate below.",
             "",
             "=== Profile Info (JSON) ===",
             json.dumps(profile_info, ensure_ascii=False, indent=2),
@@ -743,7 +952,7 @@ class CVGenerationEngine:
             ]
         )
 
-        # 🔹 Tie to template's max_chars_per_section (already added earlier)
+        # 🔹 Tie to template's max_chars_per_section
         char_limits = _get_section_char_limits(request)
         canonical_section_id = _normalize_section_id_for_evidence(section_id)
         max_chars = char_limits.get(canonical_section_id)
@@ -756,7 +965,6 @@ class CVGenerationEngine:
 
         return "\n".join(lines)
 
-
     @staticmethod
     def _build_skills_selection_prompt(
         request: CVGenerationRequest,
@@ -764,7 +972,12 @@ class CVGenerationEngine:
         skills_plan: SkillsSectionPlan,
         language: str,
     ) -> str:
-        """Build JSON-only prompt for structured skills selection."""
+        """Build JSON-only prompt for structured skills selection.
+
+        Even though the output is JSON, we still surface:
+        - Target CV language  → affects naming of inferred skills.
+        - Desired tone        → helps the LLM choose appropriate phrasing.
+        """
         params = load_parameters()
         generation_cfg: Dict[str, Any] = params.get("generation", {}) or {}
         prompts_cfg: Dict[str, str] = generation_cfg.get("prompts", {}) or {}
@@ -780,8 +993,24 @@ class CVGenerationEngine:
 
         base_prompt: str = prompts_cfg.get(
             "skills_structured",
-            DEFAULT_SKILLS_STRUCTURED_PROMPT,
+            "",
         )
+        if len(base_prompt) == 0:
+            raise RuntimeError(
+                f"Fail to load skills_structured prompt from parameters.yaml."
+            )
+
+        # 🔹 Resolve language & tone (request.language overrides function arg)
+        raw_language = getattr(request, "language", None) or language or "en"
+        language_code = raw_language or "en"
+        language_name = describe_language(language_code)
+
+        tone = (
+            getattr(request, "tone", None)
+            or getattr(request, "style_tone", None)
+            or getattr(getattr(request, "template_info", None), "tone", None)
+        )
+        tone_desc = describe_tone(tone)
 
         evidence_facts: List[str] = _collect_evidence_facts_for_section(
             evidence_plan, "skills_structured"
@@ -801,7 +1030,8 @@ class CVGenerationEngine:
         company_info = _to_serializable(raw_company_info)
 
         lines: List[str] = [
-            f"The CV language is {language}.",
+            f"The CV language is {language_name} (language_code='{language_code}').",
+            f"The overall tone of the CV is {tone_desc}.",
             "",
             "Student profile (structured JSON):",
             json.dumps(profile_info, ensure_ascii=False, indent=2),
@@ -840,63 +1070,27 @@ class CVGenerationEngine:
         return "\n".join(lines)
 
 
+
     # ------------------------------------------------------------------
     # LLM call with retries (Option C: feature flag for zero-token retry)
     # ------------------------------------------------------------------
 
+    @staticmethod
     def _get_section_token_budget_for_attempt(
-        self,
-        section_id: str,
-        attempt: int,
+            section_id: str,
+            attempt: int,
     ) -> int | None:
         """
-        Look up max_output_tokens for a given section and attempt, based on
-        section_token_budgets in parameters.yaml.
+        Compatibility wrapper around the pure resolve_token_budget().
 
-        Examples in parameters.yaml:
-
-            section_token_budgets:
-              default: [1024, 2048]
-              profile_summary: [3036, 4096]
-              skills: [3036, 4096]
-              skills_structured: [4096]      # same for all attempts
-              education: 2048                # scalar also allowed
-
-        Behaviour:
-        - attempt=1 → index 0
-        - attempt=2 → index 1, etc.
-        - If attempts exceed the configured list length, we reuse the **last** value.
-        - If config is a single int, we reuse that value for all attempts.
+        Loads parameters.yaml once per call and delegates to the pure function.
         """
         try:
-            params = load_parameters() or {}
+            all_params = load_parameters() or {}
         except Exception:
             return None
 
-        budgets_cfg = params.get("section_token_budgets", {}) or {}
-
-        # Prefer section-specific, fallback to default
-        raw = budgets_cfg.get(section_id, budgets_cfg.get("default"))
-
-        if raw is None:
-            return None
-
-        # Case 1: scalar int → same for all attempts
-        if isinstance(raw, int):
-            return raw if raw > 0 else None
-
-        # Case 2: list/tuple of ints → index by attempt, clamp to last
-        if isinstance(raw, (list, tuple)) and raw:
-            # Clamp attempt index into [0, len(raw)-1]
-            idx = max(0, min(attempt - 1, len(raw) - 1))
-            try:
-                value = int(raw[idx])
-            except Exception:
-                return None
-            return value if value > 0 else None
-
-        # Anything else is invalid
-        return None
+        return resolve_token_budget(section_id, attempt, all_params)
 
 
 
@@ -926,7 +1120,7 @@ class CVGenerationEngine:
         retry_on_zero_tokens = bool(
             self.generation_params.get("retry_on_zero_tokens", True)
         )
-        min_length_threshold = 10  # characters
+        min_length_threshold = MIN_RETRY_LENGTH
         attempt = 0
         last_result: str = ""
         # reset per top-level generate_cv call; generate_cv sets this as well
@@ -997,7 +1191,7 @@ class CVGenerationEngine:
 
                     # Try again if we still have retries left
                     if attempt < max_retries:
-                        time.sleep(1.2 * attempt)
+                        time.sleep(RETRY_SLEEP_MULTIPLIER * attempt)
                         continue
                     else:
                         # Out of retries → treat as no output
@@ -1033,7 +1227,7 @@ class CVGenerationEngine:
                         section_id=section_id,
                     )
                     if attempt < max_retries:
-                        time.sleep(1.2 * attempt)
+                        time.sleep(RETRY_SLEEP_MULTIPLIER * attempt)
                         continue
                     else:
                         logger.error(
@@ -1057,7 +1251,7 @@ class CVGenerationEngine:
                         content_preview=raw_text[:50],
                     )
                     if attempt < max_retries:
-                        time.sleep(1.2 * attempt)
+                        time.sleep(RETRY_SLEEP_MULTIPLIER * attempt)
                         continue
                     else:
                         logger.error(
@@ -1099,7 +1293,7 @@ class CVGenerationEngine:
                         f"LLM generation failed for section '{section_id}': {exc}"
                     )
 
-                time.sleep(1.2 * attempt)
+                time.sleep(RETRY_SLEEP_MULTIPLIER * attempt)
 
         self._last_retry_count = max(attempt - 1, 0)
         return last_result
@@ -1109,27 +1303,45 @@ class CVGenerationEngine:
     # ------------------------------------------------------------------
     # Structured skills generation
     # ------------------------------------------------------------------
-
     def _generate_structured_skills(
         self,
         request: CVGenerationRequest,
         skills_plan: SkillsSectionPlan,
         skills_section_text: str | None = None,
     ) -> list[OutputSkillItem]:
-        """Generate structured skills via LLM, with robust fallbacks.
-
-        - Preferred path: JSON from skills_structured prompt (can drop/keep/add skills).
-        - Fallback path: parse bullet-list 'skills' section text to infer skills.
-        - Hard fallback: taxonomy-only skills from profile_info.
-
-        IMPORTANT:
-        - For any skill that already exists in the canonical skills list,
-          we ALWAYS preserve the original level from skills_plan.canonical_skills.
-        - The LLM is only allowed to assign levels for new inferred skills.
         """
+        Generate structured skills via LLM, with robust multi-step fallbacks.
+
+        Flow:
+        1. Ask the LLM to produce JSON-only `items` (SkillSelectionItem) based on:
+           - Canonical taxonomy skills
+           - Evidence facts (cross-section)
+           - Profile + job context
+        2. Deduplicate by name (case-insensitive) and filter out invalid items.
+        3. If JSON is unusable:
+           - Try to parse skills from the free-text "skills" section bullets.
+           - If still empty → fall back to taxonomy-only skills.
+        4. For each kept skill:
+           - If its name matches a canonical skill (exact or close match), snap the
+             name and level back to the canonical values and mark `source="taxonomy"`.
+           - Otherwise, treat it as a new inferred skill using the LLM-proposed
+             name/level/source.
+        5. Optionally re-add missing canonical skills (depending on the
+           `dropping_irrelevant_skills` flag), ensuring they appear with their
+           original levels when enforced.
+        6. Drop obvious “combined” skills that merely join multiple canonicals
+           (e.g. "SQL & Python").
+        7. Finally, reconcile against the original request once more so that any
+           skill whose name matches a canonical entry always keeps the canonical level.
+
+        Returns:
+            List[OutputSkillItem] representing the final structured skills.
+        """
+
         language = getattr(request, "language", "en")
         evidence_plan: EvidencePlan | None = self._evidence_plan
 
+        # Build the JSON-only selection prompt and call the LLM.
         prompt = self._build_skills_selection_prompt(
             request, evidence_plan, skills_plan, language
         )
@@ -1139,10 +1351,8 @@ class CVGenerationEngine:
         canonical_by_name: dict[str, CanonicalSkill] = {
             (s.name or "").strip().lower(): s for s in skills_plan.canonical_skills
         }
-        canonical_names_lower: set[str] = set(canonical_by_name.keys())
 
         candidate_items: list[SkillSelectionItem] = []
-        had_json_items = False
 
         # ---------- Parse JSON from LLM ----------
         try:
@@ -1163,7 +1373,6 @@ class CVGenerationEngine:
                             error=str(exc),
                             raw=item,
                         )
-                had_json_items = bool(candidate_items)
         except Exception as exc:
             logger.warning(
                 "skills_structured_json_parse_failed",
@@ -1182,16 +1391,19 @@ class CVGenerationEngine:
                 continue
             key = name.lower()
             if key in seen_names_lower:
+                # Drop duplicates, keep the first occurrence.
                 continue
             seen_names_lower.add(key)
-            sel.name = name
+            sel.name = name # normalise whitespace
             filtered.append(sel)
 
         # ---------- Fallback if no usable JSON ----------
         if not filtered:
             inferred_from_bullets: list[SkillSelectionItem] = []
+
+            # Try extracting skills from the free-text "skills" section.
             if skills_section_text:
-                bullet_skills = _extract_skills_from_bullet_text(skills_section_text)
+                bullet_skills = parse_skills_from_bullets(skills_section_text)
                 seen_bullet: set[str] = set()
                 for name in bullet_skills:
                     norm = name.strip()
@@ -1217,6 +1429,7 @@ class CVGenerationEngine:
                 )
                 filtered = inferred_from_bullets
             else:
+                # Hard fallback: mirror canonical skills exactly as taxonomy items.
                 logger.warning(
                     "skills_structured_fallback_taxonomy_only",
                     reason="no_json_and_no_bullet_skills",
@@ -1235,6 +1448,8 @@ class CVGenerationEngine:
         result: list[OutputSkillItem] = []
         result_names_lower: set[str] = set()
 
+        alias_map = _load_skills_alias_map()
+
         for sel in filtered:
             if not sel.keep:
                 continue
@@ -1243,49 +1458,71 @@ class CVGenerationEngine:
             if not name_clean:
                 continue
 
-            key = name_clean.lower()
-            canon = canonical_by_name.get(key)
+            canon = match_canonical_skill(
+                name_clean,
+                canonical_by_name,
+                alias_map=alias_map,
+                min_coverage=MIN_SKILL_COVERAGE,
+                fuzzy_threshold=FUZZY_THRESHOLD,
+            )
 
             if canon is not None:
-                # Existing skill → ALWAYS use canonical level from profile/taxonomy
+                # Treat as canonical: snap name + level back to taxonomy
+                final_name = canon.name
                 level = canon.level
                 source = "taxonomy"
             else:
-                # New inferred skill → use LLM-proposed level (can be None)
+                # Genuine new inferred skill
+                final_name = name_clean
                 level = sel.level
                 source = sel.source or "inferred"
 
+            key = (final_name or "").strip().lower()
             result.append(
                 OutputSkillItem(
-                    name=name_clean,
+                    name=final_name,
                     level=level,
                     source=source,
                 )
             )
             result_names_lower.add(key)
 
-        # ---------- Ensure taxonomy skills are NOT lost ----------
-        # If LLM JSON was valid, we DO NOT add duplicates, but we make sure
-        # any canonical skill that never appeared at all is appended with its original level.
-        for canon in skills_plan.canonical_skills:
-            key = (canon.name or "").strip().lower()
-            if not key:
-                continue
-            if key in result_names_lower:
-                continue
-            result.append(
-                OutputSkillItem(
-                    name=canon.name,
-                    level=canon.level,
-                    source="taxonomy",
+        # If we are NOT allowing dropping, re-add missing canonical skills
+        if not dropping_irrelevant_skills:
+            # ---------- Ensure taxonomy skills are NOT lost ----------
+            for canon in skills_plan.canonical_skills:
+                key = (canon.name or "").strip().lower()
+                if not key:
+                    continue
+                if key in result_names_lower:
+                    continue
+
+                # Append any canonical skill that never appeared in the LLM output.
+                result.append(
+                    OutputSkillItem(
+                        name=canon.name,
+                        level=canon.level,
+                        source="taxonomy",
+                    )
                 )
-            )
-            result_names_lower.add(key)
+                result_names_lower.add(key)
+
+        # Drop obvious combined canonical skills like "SQL & Python"
+        filtered_result: list[OutputSkillItem] = []
+        for item in result:
+            if is_combined_canonical_name(getattr(item, "name", "") or "", canonical_by_name):
+                logger.info(
+                    "skills_combined_item_dropped",
+                    name=item.name,
+                )
+                continue
+            filtered_result.append(item)
+
+        result = filtered_result
 
         # ---------- Final safety: reconcile levels with canonical ----------
-        # Even if some code path above misbehaved, this guarantees:
-        # - Any skill whose name matches a canonical skill (case-insensitive)
-        #   will end up with the canonical level.
+        # Even if some path above misbehaved, this guarantees that any skill
+        # whose name matches a canonical skill ends up with the canonical level.
         for item in result:
             key = (item.name or "").strip().lower()
             canon = canonical_by_name.get(key)
@@ -1294,26 +1531,25 @@ class CVGenerationEngine:
 
         return result
 
-
     # ------------------------------------------------------------------
     # Build CV response
     # ------------------------------------------------------------------
-
     def _build_cv_response(
-        self,
-        request: CVGenerationRequest,
-        generated_sections: Union[Dict[str, SectionContent], List[SectionContent]],
-        *,
-        job_id: str | None = None,
-        status: GenerationStatus = GenerationStatus.COMPLETED,
-        generation_time_ms: int | None = None,
-        retry_count: int = 0,
-        cache_hit: bool = False,
-        tokens_used: int = 0,
-        cost_estimate_thb: float = 0.0,
-        skills_output: list[OutputSkillItem] | None = None,
+            self,
+            request: CVGenerationRequest,
+            generated_sections: Union[Dict[str, SectionContent], List[SectionContent]],
+            *,
+            job_id: str | None = None,
+            status: GenerationStatus = GenerationStatus.COMPLETED,
+            generation_time_ms: int | None = None,
+            retry_count: int = 0,
+            cache_hit: bool = False,
+            tokens_used: int = 0,
+            cost_estimate_thb: float = 0.0,
+            skills_output: list[OutputSkillItem] | None = None,
     ) -> CVGenerationResponse:
         """Normalize generated sections and build CVGenerationResponse."""
+        # Normalize sections into a dict
         if isinstance(generated_sections, list):
             requested_ids = getattr(request, "sections", []) or []
             sections_dict = {
@@ -1325,8 +1561,9 @@ class CVGenerationEngine:
 
         profile_info = getattr(request, "profile_info", None)
 
-        params = load_parameters()
-        gen_cfg = params.get("generation", {}) or {}
+        # Clamp generation time
+        all_params = load_parameters()
+        gen_cfg = all_params.get("generation", {}) or {}
         max_time_ms = int(gen_cfg.get("max_generation_time_ms", 60_000))
 
         raw_time_ms = generation_time_ms or 0
@@ -1346,21 +1583,19 @@ class CVGenerationEngine:
 
         justification = Justification()
 
+        # Final job_id
         user_part = getattr(request, "user_id", "unknown")
         safe_user_part = "".join(
             ch for ch in str(user_part) if ch.isalnum() or ch in "-_"
         )
         final_job_id = job_id or getattr(request, "job_id", f"JOB_{safe_user_part}")
 
+        # Template id (legacy → new → fallback)
         template_info = getattr(request, "template_info", None)
-
-        # Prefer legacy template_info.template_id if present,
-        # otherwise fall back to the new public API's top-level template_id,
-        # and only then use UNKNOWN_TEMPLATE.
         template_id = (
-            getattr(template_info, "template_id", None)
-            or getattr(request, "template_id", None)
-            or "UNKNOWN_TEMPLATE"
+                getattr(template_info, "template_id", None)
+                or getattr(request, "template_id", None)
+                or "UNKNOWN_TEMPLATE"
         )
 
         payload = {
@@ -1378,129 +1613,200 @@ class CVGenerationEngine:
             "error_details": None,
         }
 
-
         return CVGenerationResponse.model_validate(payload)
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-
     def generate_cv(
-        self,
-        request: CVGenerationRequest,
-        evidence_plan: EvidencePlan | None = None,
-        skills_plan: SkillsSectionPlan | None = None,
+            self,
+            request: CVGenerationRequest,
+            evidence_plan: EvidencePlan | None = None,
+            skills_plan: SkillsSectionPlan | None = None,
     ) -> CVGenerationResponse:
         """Generate CV sections end-to-end."""
-        sections = getattr(request, "sections", []) or []
-        self._current_user_id = getattr(request, "user_id", "unknown")
-        self._last_retry_count = 0
-
-        char_limits = _get_section_char_limits(request)
-        available_sections = _get_available_sections(request)
-
-        # Resolve strictly based on template order (fallbacks described above)
-        effective_sections = _resolve_effective_sections(request, available_sections)
-
-        logger.info(
-            "stage_b_resolved_sections",
-            requested_sections=sections,
-            available_sections=list(available_sections),
-            effective_sections=effective_sections,
+        # ------------------------------------------------------------
+        # Bind request-scoped structured logging context
+        # ------------------------------------------------------------
+        bind_contextvars(
+            request_id=getattr(request, "request_id", None) or "N/A",
+            job_id=getattr(request, "job_id", None) or "N/A",
+            user_id=getattr(request, "user_id", "unknown"),
+            template_id=(
+                    getattr(getattr(request, "template_info", None), "template_id", None)
+                    or getattr(request, "template_id", None)
+                    or "UNKNOWN_TEMPLATE"
+            ),
+            language=getattr(request, "language", "en"),
+            sections_count=len(getattr(request, "sections", []) or []),
         )
 
-        generated_sections: dict[str, SectionContent] = {}
-        skills_output: list[OutputSkillItem] | None = None
+        try:
+            sections = getattr(request, "sections", []) or []
+            self._current_user_id = getattr(request, "user_id", "unknown")
+            self._last_retry_count = 0
 
-        # use monotonic to align with tests and llm_metrics
-        start_time = time.monotonic()
+            char_limits = _get_section_char_limits(request)
+            available_sections = _get_available_sections(request)
 
-        self._evidence_plan = evidence_plan
+            # Resolve strictly based on template order
+            effective_sections = _resolve_effective_sections(request, available_sections)
 
-        if "skills" in effective_sections and skills_plan is None:
-            skills_plan = _build_skills_plan_from_profile(request)
-
-        for section_id in effective_sections:
-            raw_text = self._call_llm_with_retries(
-                self._build_section_prompt(request, evidence_plan, section_id),
-                section_id,
+            logger.info(
+                "stage_b_resolved_sections",
+                requested_sections=sections,
+                available_sections=list(available_sections),
+                effective_sections=effective_sections,
             )
-            truncated = _truncate_text(
-                raw_text or "", char_limits.get(section_id)
-            )
+            structured_first = "skills_structured" in effective_sections
 
-            text_for_section = truncated or ""
-            if len(text_for_section) < 10:
-                logger.warning(
-                    "section_text_too_short",
-                    section_id=section_id,
-                    length=len(text_for_section),
-                    reason="LLM returned empty/failed output",
-                )
-
-                text_for_section = build_section_fallback_text(
-                    request,
-                    section_id,
-                    reason="LLM output empty/too short after retries",
-                )
-
-            word_count = len(text_for_section.split())
-            generated_sections[section_id] = SectionContent(
-                text=text_for_section,
-                word_count=word_count,
-                matched_jd_skills=[],
-                confidence_score=1.0,
+            logger.info(
+                "stage_b_telemetry_sections",
+                mode="structured_first" if structured_first else "legacy_skills",
+                sections_requested=len(sections),
+                sections_available=len(available_sections),
+                sections_effective=len(effective_sections),
+                has_skills_section=("skills" in effective_sections),
+                has_skills_structured=("skills_structured" in effective_sections),
             )
 
-            if (
-                section_id == "skills"
-                and skills_plan is not None
-                and skills_output is None
-            ):
+            generated_sections: dict[str, SectionContent] = {}
+            skills_output: list[OutputSkillItem] | None = None
+
+            start_time = time.monotonic()
+            self._evidence_plan = evidence_plan
+
+            # Build skills plan
+            if (structured_first or "skills" in effective_sections) and skills_plan is None:
+                skills_plan = _build_skills_plan_from_profile(request)
+
+            # 1) Structured skills FIRST if enabled
+            if structured_first and skills_plan is not None:
                 try:
                     skills_output = self._generate_structured_skills(
-                        request, skills_plan, skills_section_text=text_for_section
+                        request,
+                        skills_plan,
+                        skills_section_text=None,
                     )
-                except Exception as exc:  # pragma: no cover - defensive
+                except Exception as exc:
                     logger.error(
-                        "skills_structured_generation_failed", error=str(exc)
+                        "skills_structured_generation_failed_prepass",
+                        error=str(exc),
                     )
-                    skills_output = []
-                    for sk in skills_plan.canonical_skills:
-                        skills_output.append(
-                            OutputSkillItem(
-                                name=sk.name,
-                                level=sk.level,
-                                source="taxonomy",
-                            )
+                    skills_output = _build_taxonomy_only_fallback(skills_plan)
+
+            # 2) Generate all text sections (skills text is special)
+            for section_id in effective_sections:
+                if section_id == "skills_structured":
+                    continue
+
+                if section_id == "skills" and structured_first and skills_output is not None:
+                    text_for_section = format_plain_skill_bullets(skills_output)
+                    text_for_section = _truncate_text(
+                        text_for_section or "",
+                        char_limits.get("skills"),
+                    )
+
+                    if len(text_for_section.strip()) < MIN_SECTION_LENGTH:
+                        logger.warning(
+                            "section_text_too_short",
+                            section_id=section_id,
+                            length=len(text_for_section),
+                            reason="structured_skills_rendered_empty_or_short",
+                        )
+                        text_for_section = build_section_fallback_text(
+                            request,
+                            section_id,
+                            reason="no structured skills available",
                         )
 
-        # elapsed time
-        elapsed_ms = int((time.monotonic() - start_time) * 1000)
+                else:
+                    raw_text = self._call_llm_with_retries(
+                        self._build_section_prompt(request, evidence_plan, section_id),
+                        section_id,
+                    )
+                    truncated = _truncate_text(
+                        raw_text or "",
+                        char_limits.get(section_id),
+                    )
 
-        # 🔒 FINAL SAFETY: restore original levels for matching skills
-        if skills_output:
+                    text_for_section = truncated or ""
+                    if len(text_for_section) < MIN_SECTION_LENGTH:
+                        logger.warning(
+                            "section_text_too_short",
+                            section_id=section_id,
+                            length=len(text_for_section),
+                            reason="LLM returned empty/failed output",
+                        )
+                        text_for_section = build_section_fallback_text(
+                            request,
+                            section_id,
+                            reason="LLM output empty",
+                        )
+
+                    if (
+                            section_id == "skills"
+                            and not structured_first
+                            and skills_plan is not None
+                            and skills_output is None
+                    ):
+                        try:
+                            skills_output = self._generate_structured_skills(
+                                request,
+                                skills_plan,
+                                skills_section_text=text_for_section,
+                            )
+                        except Exception as exc:
+                            logger.error(
+                                "skills_structured_generation_failed_legacy",
+                                error=str(exc),
+                            )
+                            skills_output = _build_taxonomy_only_fallback(skills_plan)
+
+                generated_sections[section_id] = SectionContent(
+                    text=text_for_section,
+                    word_count=len(text_for_section.split()),
+                    matched_jd_skills=[],
+                    confidence_score=1.0,
+                )
+
+            elapsed_ms = int((time.monotonic() - start_time) * 1000)
+
+            if skills_output:
+                logger.info(
+                    "skills_before_reconcile",
+                    skills=[(s.name, s.level, s.source) for s in skills_output],
+                )
+                skills_output = _reconcile_skill_levels_with_request(request, skills_output)
+                logger.info(
+                    "skills_after_reconcile",
+                    skills=[(s.name, s.level, s.source) for s in skills_output],
+                )
+
+            # 🔹 Telemetry snapshot for skills + overall Stage B
+            skills_metrics = _summarize_skills_telemetry(skills_output)
+
             logger.info(
-                "skills_before_reconcile",
-                skills=[(s.name, s.level, s.source) for s in skills_output],
-            )
-            skills_output = _reconcile_skill_levels_with_request(
-                request,
-                skills_output,
-            )
-            logger.info(
-                "skills_after_reconcile",
-                skills=[(s.name, s.level, s.source) for s in skills_output],
+                "stage_b_telemetry_summary",
+                generation_time_ms=elapsed_ms,
+                retry_count=self._last_retry_count,
+                sections_generated=len(generated_sections),
+                cache_hit=False,
+                tokens_used=0,
+                cost_estimate_thb=0.0,
+                **skills_metrics,
             )
 
-        return self._build_cv_response(
-            request=request,
-            generated_sections=generated_sections,
-            generation_time_ms=elapsed_ms,
-            retry_count=self._last_retry_count,
-            cache_hit=False,
-            tokens_used=0,
-            cost_estimate_thb=0.0,
-            skills_output=skills_output,
-        )
+            return self._build_cv_response(
+                request=request,
+                generated_sections=generated_sections,
+                generation_time_ms=elapsed_ms,
+                retry_count=self._last_retry_count,
+                cache_hit=False,
+                tokens_used=0,
+                cost_estimate_thb=0.0,
+                skills_output=skills_output,
+            )
 
+        finally:
+            clear_contextvars()

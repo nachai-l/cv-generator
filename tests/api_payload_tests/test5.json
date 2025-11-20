@@ -1,0 +1,110 @@
+{
+  "user_id": "U-3001",
+  "language": "en",
+  "language_tone": "funny",
+  "template_info": {
+    "template_id": "T_EMPLOYER_STD_V3",
+    "sections_order": [
+      "profile_summary",
+      "skills",
+      "experience",
+      "publications",
+      "training",
+      "references",
+      "additional_info"
+    ]
+  },
+  "student_profile": {
+    "personal_info": {
+      "name": "Somchai Chinnawong",
+      "email": "somchai.chin@example.com",
+      "phone": "+66-80-123-4567",
+      "linkedin": "https://www.linkedin.com/in/somchai-chinnawong/"
+    },
+    "education": [
+      {
+        "id": "edu#bsc_kasetsart_cs",
+        "degree": "BSc in Computer Science",
+        "institution": "Kasetsart University",
+        "gpa": 3.6,
+        "start_date": "2015-08-01",
+        "graduation_date": "2019-05-31",
+        "major": "Computer Science"
+      }
+    ],
+    "experience": [
+      {
+        "id": "work_exp#junior_ds_001",
+        "title": "Junior Data Scientist",
+        "company": "True Digital Group",
+        "start_date": "2020-01-01",
+        "end_date": "2022-12-31",
+        "responsibilities": [
+          "Developed predictive models for customer churn and campaign targeting.",
+          "Worked closely with product teams to define and validate business metrics.",
+          "Cleaned and transformed large datasets using Python and SQL."
+        ]
+      }
+    ],
+    "skills": [
+      {
+        "id": "skill#python",
+        "name": "Python",
+        "description": "General-purpose programming and data analysis",
+        "level": "L3_Advanced"
+      },
+      {
+        "id": "skill#ml",
+        "name": "Machine Learning",
+        "description": "Supervised and unsupervised learning for tabular data",
+        "level": "L3_Advanced"
+      }
+    ],
+    "awards": [],
+    "extracurriculars": [],
+
+    "publications": [
+      {
+        "id": "pub#churn_ml",
+        "title": "Customer Churn Prediction Using Gradient Boosting Models",
+        "venue": "IEEE Thailand Data Science Conference",
+        "year": 2022,
+        "description": "Presented a study on improving churn prediction accuracy using ensemble learning."
+      }
+    ],
+    "training": [
+      {
+        "id": "training#data_eng_cert",
+        "title": "Data Engineering with Google Cloud",
+        "provider": "Google Cloud Skills Boost",
+        "training_date": "2023-03-15",
+        "description": "Hands-on training covering BigQuery, Dataflow, and pipeline automation."
+      }
+    ],
+    "references": [
+      {
+        "id": "ref#manager_td",
+        "name": "Ms. Warunee Suksawat",
+        "relationship": "Former Data Science Manager",
+        "contact": "+66-89-555-1212",
+        "email": "warunee.su@example.com"
+      }
+    ],
+    "additional_info": [
+      {
+        "id": "add#languages",
+        "label": "Languages",
+        "value": "Thai (native), English (professional working proficiency)"
+      },
+      {
+        "id": "add#certs",
+        "label": "Certifications",
+        "value": "Google Data Analytics Professional Certificate"
+      }
+    ]
+  },
+  "job_role_info": {},
+  "job_position_info": {},
+  "company_info": {},
+  "user_input_cv_text_by_section": {}
+}

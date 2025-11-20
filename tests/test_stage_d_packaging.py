@@ -8,10 +8,14 @@ Covers:
   LLM usage aggregation, and basic consistency adjustments.
 - build_error_response(): standardized ErrorResponse construction and
   HTTP status propagation.
+
+Stage D MUST NOT mutate sections or skills content; it only enriches
+metadata and logs.
 """
 
 from __future__ import annotations
 
+import copy
 import unittest
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
@@ -26,7 +30,6 @@ from schemas.output_schema import (
     QualityMetrics,
     SectionContent,
     UnsupportedClaim,
-    ValidationWarning,
 )
 from functions.stage_d_packaging import (
     LLMUsageSummary,
@@ -268,6 +271,104 @@ class TestStageDPackaging(unittest.TestCase):
         self.assertEqual(err.request_id, "REQ_fixed_123")
         self.assertEqual(err.error_code, "VALIDATION_ERROR")
         self.assertEqual(err.message, "Invalid input payload.")
+
+    # ------------------------------------------------------------------
+    # New tests for updated Stage D behavior
+    # ------------------------------------------------------------------
+
+    def test_finalize_cv_response_preserves_existing_metadata_request_id(self) -> None:
+        """
+        If metadata.request_id is already set by upstream, Stage D should
+        NOT overwrite it, even when finalize_cv_response() is called with
+        an explicit request_id argument.
+        """
+        cv = _build_minimal_cv_response()
+        cv.metadata.request_id = "REQ_meta_existing"
+
+        finalized, req_id = finalize_cv_response(
+            cv,
+            request_id="REQ_param_value",
+            user_id="user-abc",
+            profile_info=None,
+            llm_usage=None,
+            generation_start=None,
+            generation_end=None,
+        )
+
+        # The returned request_id is what Stage D will propagate in headers
+        self.assertEqual(req_id, "REQ_param_value")
+        # But metadata.request_id should remain untouched
+        self.assertEqual(finalized.metadata.request_id, "REQ_meta_existing")
+
+    def test_finalize_cv_response_sets_stage_d_completed_flag(self) -> None:
+        """
+        finalize_cv_response() should mark metadata.stage_d_completed=True
+        (best-effort) so downstream systems can detect pipeline completion.
+        """
+        cv = _build_minimal_cv_response()
+        # Ensure the field is absent or False before calling Stage D
+        self.assertFalse(
+            getattr(cv.metadata, "stage_d_completed", False),
+            msg="stage_d_completed should not be set before finalize_cv_response",
+        )
+
+        finalized, _ = finalize_cv_response(
+            cv,
+            request_id="REQ_stage_d_flag",
+            user_id="user-xyz",
+            profile_info=None,
+            llm_usage=None,
+            generation_start=None,
+            generation_end=None,
+        )
+
+        self.assertTrue(
+            getattr(finalized.metadata, "stage_d_completed", False),
+            msg="stage_d_completed should be True after finalize_cv_response",
+        )
+
+    def test_finalize_cv_response_does_not_mutate_sections_or_skills(self) -> None:
+        """
+        Stage D must not change sections or skills content; it only enriches
+        metadata and logging fields.
+        """
+        cv = _build_minimal_cv_response()
+
+        # Take deep copies of sections and skills for comparison
+        original_sections = copy.deepcopy(cv.sections)
+        original_skills = copy.deepcopy(cv.skills)
+
+        finalized, _ = finalize_cv_response(
+            cv,
+            request_id="REQ_no_content_mutation",
+            user_id="user-content",
+            profile_info=None,
+            llm_usage=LLMUsageSummary(
+                model="gemini-2.5-flash-internal",
+                prompt_tokens=50,
+                completion_tokens=50,
+                total_tokens=100,
+                total_cost_thb=0.2,
+            ),
+            generation_start=None,
+            generation_end=None,
+        )
+
+        # Sections: keys and texts should be unchanged
+        self.assertEqual(set(finalized.sections.keys()), set(original_sections.keys()))
+        for key in original_sections:
+            self.assertIn(key, finalized.sections)
+            self.assertEqual(
+                finalized.sections[key].text,
+                original_sections[key].text,
+                msg=f"Section text mutated for '{key}'",
+            )
+
+        # Skills: list length and (name, level, source) tuples should stay the same
+        self.assertEqual(len(finalized.skills or []), len(original_skills or []))
+        orig_tuples = [(s.name, s.level, s.source) for s in original_skills]
+        fin_tuples = [(s.name, s.level, s.source) for s in (finalized.skills or [])]
+        self.assertEqual(orig_tuples, fin_tuples)
 
 
 if __name__ == "__main__":

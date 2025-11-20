@@ -54,7 +54,7 @@ class DummyNewRequestForStageC:
         self,
         template_id: str = "T_NEW",
         sections: List[str] | None = None,
-        language: str = "en",
+        language: Any = "en",
         job_id: str = "JOB_NEW",
     ) -> None:
         self.template_id = template_id
@@ -86,11 +86,18 @@ class DummyRequestForStageC:
         self,
         template_id: str = "T_REQ",
         job_id: str = "JOB_REQ",
-        language: str = "en",
+        language: Any = "en",
     ) -> None:
         self.template_info = DummyTemplateInfoForReq(template_id)
         self.job_id = job_id
         self.language = language
+
+
+class DummyLangEnum:
+    """Simple enum-like object with a .value attribute used to test language normalization."""
+
+    def __init__(self, value: str) -> None:
+        self.value = value
 
 
 # ---------------------------------------------------------------------------
@@ -173,8 +180,11 @@ class TestSectionValidation(LoggingTestCase):
             }
         }
 
-    def test_unknown_sections_dropped_and_allowed_kept(self) -> None:
-        """run_stage_c_validation should drop sections not listed in template_info."""
+    def test_template_order_respected_and_extra_sections_kept(self) -> None:
+        """
+        run_stage_c_validation should respect template_info order but
+        keep any extra sections that Stage B already generated.
+        """
         # Response from Stage B with an allowed section and an extra one
         meta = DummyMeta()
         resp = CVGenerationResponse.model_construct(
@@ -183,7 +193,7 @@ class TestSectionValidation(LoggingTestCase):
             language="en",
             sections={
                 "profile_summary": SectionContent.model_construct(text="Valid content"),
-                "extra_section": SectionContent.model_construct(text="Should be dropped"),
+                "extra_section": SectionContent.model_construct(text="Should be kept"),
             },
             metadata=meta,
             skills=None,
@@ -201,8 +211,10 @@ class TestSectionValidation(LoggingTestCase):
                 original_request=None,
             )
 
+        # Order: template-defined first, then extra sections
+        self.assertEqual(list(validated.sections.keys()), ["profile_summary", "extra_section"])
         self.assertIn("profile_summary", validated.sections)
-        self.assertNotIn("extra_section", validated.sections)
+        self.assertIn("extra_section", validated.sections)
 
     def test_empty_section_dropped_with_warning(self) -> None:
         """Sections that become empty after cleaning should be dropped and logged."""
@@ -293,12 +305,15 @@ class TestSkillsValidation(LoggingTestCase):
         }
 
     def test_skills_normalized_deduplicated_and_capped(self) -> None:
-        """Skills should be stripped, deduplicated by (name, level), and capped to max_skills."""
+        """
+        Skills should be stripped, deduplicated by name (case-insensitive),
+        and capped to max_skills, without changing canonical levels.
+        """
         meta = DummyMeta()
 
         skills_raw: List[Any] = [
             OutputSkillItem.model_construct(name=" Skill ", level="L1", source="profile"),
-            OutputSkillItem.model_construct(name="skill", level="L1", source="profile"),  # duplicate
+            OutputSkillItem.model_construct(name="skill", level="L1", source="profile"),  # duplicate name
             "Other",  # raw string → treated as name
         ]
 
@@ -329,8 +344,6 @@ class TestSkillsValidation(LoggingTestCase):
         names = {s.name for s in skills}
         # Dedup should keep only one "Skill" variant
         self.assertIn("Skill", names)
-        # Due to max_skills=2, "Other" may or may not be present depending on order,
-        # but we at least expect not to see multiple variants of the same skill
         self.assertEqual(
             sum(1 for n in names if n.lower() == "skill"),
             1,
@@ -341,6 +354,54 @@ class TestSkillsValidation(LoggingTestCase):
             any("Skills list truncated" in msg for msg in meta.validation_warnings),
             msg=f"Expected skills truncation warning, got: {meta.validation_warnings}",
         )
+
+    def test_skills_dedup_by_name_even_if_levels_differ(self) -> None:
+        """
+        If the same skill name appears with different levels, Stage C should
+        still emit only one entry for that skill name (defensive behaviour),
+        without trying to override a non-empty level chosen upstream.
+        """
+        meta = DummyMeta()
+
+        skills_raw: List[Any] = [
+            OutputSkillItem.model_construct(name="Python", level="L3", source="profile"),
+            OutputSkillItem.model_construct(name="Python", level="L4", source="profile"),  # different level
+        ]
+
+        resp = CVGenerationResponse.model_construct(
+            template_id="T_TEST",
+            job_id="JOB1",
+            language="en",
+            sections={},
+            metadata=meta,
+            skills=skills_raw,
+        )
+
+        template_info: Dict[str, Any] = {
+            "sections_order": [],
+            "max_chars_per_section": {},
+        }
+
+        def _cfg() -> Dict[str, Any]:
+            return {
+                "validation": {
+                    "max_section_chars_default": 1000,
+                    "drop_empty_sections": True,
+                    "enable_safety_cleaning": True,
+                    "max_skills": 10,
+                }
+            }
+
+        with patch("functions.stage_c_validation.load_parameters", _cfg):
+            validated = run_stage_c_validation(
+                resp,
+                template_info=template_info,
+                original_request=None,
+            )
+
+        skills = validated.skills or []
+        python_skills = [s for s in skills if s.name.lower() == "python"]
+        self.assertEqual(len(python_skills), 1, msg=f"Expected only one Python skill, got: {skills}")
 
 
 # ---------------------------------------------------------------------------
@@ -650,6 +711,36 @@ class TestCrossChecksAgainstRequest(LoggingTestCase):
         self.assertIs(validated, resp)
         self.assertIn("language mismatch", " ".join(meta.validation_warnings))
 
+    def test_language_enum_and_string_considered_equal(self) -> None:
+        """
+        If request.language is an enum-like object and response.language is a string
+        representing the same logical code (e.g. 'en' vs 'EN'), Stage C should not
+        report a mismatch.
+        """
+        meta = DummyMeta()
+        # Response uses uppercase string
+        resp = CVGenerationResponse.model_construct(
+            template_id="T_TEST",
+            job_id="JOB1",
+            language="EN",
+            sections={},
+            metadata=meta,
+            skills=None,
+        )
+        # Request uses enum-like object with .value
+        req = DummyRequestForStageC(template_id="T_TEST", job_id="JOB1", language=DummyLangEnum("en"))
+
+        with patch("functions.stage_c_validation.load_parameters", lambda: self._base_cfg()):
+            validated = run_stage_c_validation(
+                resp,
+                template_info={},
+                original_request=req,
+            )
+
+        self.assertIs(validated, resp)
+        joined = " ".join(meta.validation_warnings)
+        self.assertNotIn("language mismatch", joined, msg=f"Unexpected language mismatch: {joined}")
+
     def test_missing_template_id_filled_from_new_shape_request_without_template_info(self) -> None:
         """
         If response.template_id is missing and the request has only a top-level
@@ -885,12 +976,13 @@ class TestNewRequestShapeIntegration(LoggingTestCase):
                 original_request=req,
             )
 
-        # Only the section from req.sections should be kept
-        self.assertIn("profile_summary", validated.sections)
-        self.assertNotIn("extra_section", validated.sections)
+        # Only the section from req.sections should be used for ordering,
+        # extra_section should be appended after it (since Stage B already generated it).
+        self.assertEqual(list(validated.sections.keys()), ["profile_summary", "extra_section"])
 
         # template_id should be filled from the new-shape request
         self.assertEqual(validated.template_id, "T_NEW_REQ")
+
 
 if __name__ == "__main__":
     unittest.main()

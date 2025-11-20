@@ -23,6 +23,13 @@ generation:
   use_stub: false                # When true, use stub LLM responses for testing
   verbose_main: true             # Extra logging for main pipeline (Stage B/C)
   fallback_text: "[Fallback]"    # Used when generation fails and a safe default string is required
+  dropping_irrelevant_skills: true
+
+  # --- Magic-number replacements ----------
+  retry_thresholds:
+    min_section_length: 10         # Replace inline constant MIN_SECTION_LENGTH
+    retry_short_length: 10         # Replace MIN_RETRY_LENGTH
+    retry_backoff_multiplier: 1.2  # Replace RETRY_SLEEP_MULTIPLIER
 
   # --- Content / word-count expectations ------------------------------------
   target_word_count: 100
@@ -45,15 +52,41 @@ generation:
     - Map every claim to evidence (include evidence_ids in justification metadata).
 
   # -----------------------------------------------------------------------------
+  # NEW ① — Skill Matching Configuration
+  # -----------------------------------------------------------------------------
+  skills_matching:
+    alias_map_file: "alias_mapping.yaml"
+    # Minimum share of canonical tokens required to treat candidate as a "rename"
+    # e.g. canonical = ["machine", "learning"], candidate = ["machine", "learning", "systems"]
+    min_coverage: 0.6
+
+    # Optional fuzzy matching threshold (disabled if null)
+    # 0.87 recommended: catches light typos but avoids false matches
+    fuzzy_threshold: 0.87
+
+    # Whether to allow fuzzy matching at all
+    enable_fuzzy_matching: true
+
+  # -----------------------------------------------------------------------------
   # Section-level prompts
   # -----------------------------------------------------------------------------
   prompts:
-    # Fallback / generic prompt when no section-specific template exists
-    default: |
+    # ========== DEFAULT - PARAGRAPH STYLE  ==========
+    paragraph_default: |
       Write a concise, professional paragraph.
-      Do not use bullet points or numbering.
+      Do NOT use bullet points or numbering.
       Avoid markdown formatting like **bold** or *italics*.
-      Stay factual and grounded in the details above.
+      Maintain a neutral, professional tone.
+      Focus on clarity, impact, and factual accuracy.
+
+    # ========== DEFAULT - BULLET STYLE ==========
+    bullet_default: |
+      Write 2–6 concise bullet points (can be increased if necessary).
+      - Each bullet must begin with a strong action verb OR be a short, single-term bullet (choose one format and stay consistent).
+      - Remove filler and redundant phrases.
+      - Avoid markdown formatting (**bold**, *italics*).
+      - Keep each bullet to one sentence or one short phrase.
+      - Focus on accomplishments, outcomes, skills, and tools relevant to the role.
 
     # Experience → markdown blocks per role
     experience: |
@@ -79,8 +112,12 @@ generation:
       Use this exact format: '- short phrase'.
       Each item should be 2–6 words.
     
-      Start from the skills list provided in the context (from the structured skills JSON).
+      Each bullet MUST correspond to exactly one skill from the structured skills list.
+      - Do NOT merge multiple skills into one bullet (no "SQL & Python").
+      - Do NOT rename or paraphrase existing skill names.
+    
       Do not introduce new skills that are not in that list.
+      Prefer skill that already come with level and, if available, matched with job role or job description .
       Prefer concrete, domain-specific skills over vague soft skills.
       Do not include headings, numbering, or commentary.
 
@@ -88,20 +125,29 @@ generation:
     # Used by _build_skills_selection_prompt to select / enrich skills.
     skills_structured: |
       You are helping to prepare the "skills" section of a CV.
-
+    
       You are given:
       - A list of existing skills from our controlled taxonomy (canonical skills).
       - You may also add new skills freely, based on the provided evidence context.
-
+      - Prefer skill that already come with level and, if available, matched with job role or job description .
+    
       IMPORTANT RULES:
       1. You MUST NOT rename, paraphrase, or otherwise change any existing skill name.
+         - If the taxonomy skill is "SQL", you must output "SQL", not "SQL & Python", "SQL Programming", or "SQL Databases".
       2. You MUST preserve the exact level value for existing skills from the taxonomy.
       3. You may reorder skills to optimize relevance for the target role.
       4. You may remove skills that are less relevant by setting "keep": false.
-      5. You may add new skills that are clearly supported by the candidate’s experience, profile, projects, certifications or awards.
-      6. Keep skill names concise (2–5 words). Avoid overly broad or vague terms.
+      5. You may add new inferred skills supported by evidence.
+      6. Keep new skill names concise (2–5 words). Avoid overly broad or vague terms.
       7. When in doubt, keep existing skills and add only meaningful new ones.
-
+      8. NEVER combine multiple existing skills into a single item.
+         - Do NOT output "SQL & Python" if "SQL" and "Python" are separate skills.
+         - Each item must correspond to exactly one skill name.
+      9. If you want to express a broader capability, keep the original taxonomy skills
+         and add a new inferred skill (e.g. "Data Pipelines") instead of merging names.
+      10. Whenever a specific tool, language, or platform appears in the 
+         experience or project descriptions (e.g., "BigQuery", "TensorFlow", "Docker"), 
+         add it as a separate inferred skill, as long as it is clearly used by the candidate.
       Return ONLY valid JSON with this exact structure:
       {
         "items": [
@@ -139,6 +185,49 @@ generation:
       - Award name, Organization (optional year)
       Keep it concise, 1 line per item.
 
+    publications: |
+      Write a concise bullet list of the candidate’s key publications.
+      - Use 1–5 bullets.
+      - Each bullet: title (or topic), venue or journal (if available), and year.
+      - Focus on publications that are relevant to the target role.
+      - Use a consistent style and avoid markdown formatting.
+
+    training: |
+      Write a concise bullet list summarizing the candidate’s relevant trainings and courses.
+      - Group related items logically.
+      - Include the course name, provider (if known), and year.
+      - Highlight trainings that support the target role or industry.
+      - Avoid markdown formatting like **bold** or numbered lists.
+
+    references: |
+      Generate a short "References" section.
+      - If concrete names are present, format as: Name – Relationship, Organization (optional), Contact (if explicitly provided).
+      - If no specific names are given, use a standard phrase such as "Available upon request."
+      - Keep the tone professional and concise.
+
+    additional_info: |
+      Write a short "Additional Information" section.
+      - Combine any remaining relevant facts that do not fit other sections (e.g., languages, relocation, work authorization, side activities).
+      - Use either a short paragraph or 2–4 bullets.
+      - Keep it factual and avoid repetition from other sections.
+
+# -----------------------------------------------------------------------------
+# Treat these as the canonical “core bundle” only when explicitly enabled
+# -----------------------------------------------------------------------------
+core_sections:
+  - profile_summary
+  - skills
+  - experience
+  - education
+  - certifications
+  - awards
+  - projects
+  - interests
+  - publications
+  - training
+  - references
+  - additional_info
+
 # -----------------------------------------------------------------------------
 # Cross-section evidence sharing
 # Controls which sections' evidence is visible when generating each section.
@@ -147,8 +236,12 @@ cross_section_evidence_sharing:
   default: [] # Evidence from own section only
   profile_summary: ["all"] # Profile summary can use evidence from all sections
   skills: ["skills_structured"] # ["profile_summary", "projects", "experience", "certifications", "awards"]
-  skills_structured: ["profile_summary", "projects", "experience", "certifications", "awards"]
+  skills_structured: ["profile_summary", "projects", "experience", "certifications", "awards", "publications",  "training"]
   experience: ["skills", "certifications"]
+  publications: []
+  training: ["education", "experience"]
+  references: []
+  additional_info: []
 
 # -----------------------------------------------------------------------------
 # Section token budgets
@@ -213,7 +306,7 @@ security:
 # Validation configuration
 # -----------------------------------------------------------------------------
 validation:
-  min_skills_required: 3        # Fail validation if fewer skills than this
+  min_skills_required: 2        # Fail validation if fewer skills than this
   min_education_required: 0     # Minimum required education entries (0 = no requirement)
   require_email: true           # Student profile must contain an email
   require_name: true            # Student profile must contain a name

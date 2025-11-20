@@ -8,7 +8,7 @@ from typing import Any, Dict
 from types import SimpleNamespace
 
 from functions.utils.baseline_renderer import build_baseline_response
-from tests.test_utils import (  # type: ignore  # noqa: E402
+from tests.utils_test_support import (  # type: ignore  # noqa: E402
     load_legacy_yaml_payload,
     compute_sections_from_legacy_template,
 )

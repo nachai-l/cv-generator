@@ -1,4 +1,4 @@
-# tests/test_utils.py
+# tests/utils_test_support.py
 """
 Shared helpers for tests and mock CV generation scripts.
 
@@ -47,6 +47,8 @@ def load_legacy_yaml_payload() -> Dict[str, Any]:
         "profile_info": {...},
         "template_info": {...},
         "user_input_cv_text_by_section": {...},
+        "language": "en",     # <-- now added (if present in template_info.yaml)
+        "tone": "funny",      # <-- now added (if present in template_info.yaml)
     }
     """
     company_info = load_yaml_file(JSON_INPUT_DIR / "company_info.yaml")
@@ -56,7 +58,11 @@ def load_legacy_yaml_payload() -> Dict[str, Any]:
     template_info = load_yaml_file(JSON_INPUT_DIR / "template_info.yaml")
     user_sections = load_yaml_file(JSON_INPUT_DIR / "user_input_cv_text_by_section.yaml")
 
-    return {
+    # 🔹 Lift language/tone out of template_info into top-level payload
+    language = template_info.pop("language", None)
+    tone = template_info.pop("tone", None)
+
+    payload: Dict[str, Any] = {
         "company_info": company_info,
         "job_position_info": job_position_info,
         "job_role_info": job_role_info,
@@ -64,6 +70,13 @@ def load_legacy_yaml_payload() -> Dict[str, Any]:
         "template_info": template_info,
         "user_input_cv_text_by_section": user_sections,
     }
+
+    if language is not None:
+        payload["language"] = language
+    if tone is not None:
+        payload["tone"] = tone
+
+    return payload
 
 
 # ---------------------------------------------------------------------------

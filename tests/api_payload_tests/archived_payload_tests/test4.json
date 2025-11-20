@@ -1,5 +1,5 @@
 {
-  "user_id": "U-2001",
+  "user_id": "U-2002",
   "language": "en",
   "template_id": "T_EMPLOYER_STD_V3",
   "sections": [
@@ -107,38 +107,6 @@
       }
     ]
   },
-  "target_role_taxonomy": {
-    "role_title": "AI Product Manager",
-    "role_description": "Leads cross-functional teams to design, build, and scale AI-powered products that deliver measurable business value.",
-    "role_required_skills": [
-      "Product strategy",
-      "Machine learning systems",
-      "Stakeholder communication",
-      "Experiment design",
-      "Data-driven decision making"
-    ]
-  },
-  "target_jd_taxonomy": {
-    "job_title": "Senior AI Product Manager",
-    "job_required_skills": [
-      "Product roadmapping",
-      "ML model lifecycle management",
-      "Cross-functional leadership",
-      "Experimentation and A/B testing",
-      "User-centric discovery"
-    ],
-    "job_responsibilities": [
-      "Define and drive the vision for AI-powered products in the digital banking portfolio.",
-      "Partner with data science, engineering, and design to prioritize and deliver impactful features.",
-      "Establish measurable success metrics and run experiments to validate product hypotheses.",
-      "Communicate roadmap, trade-offs, and results to senior leadership and key stakeholders."
-    ],
-    "company_info": {
-      "name": "Hikari Digital Bank",
-      "industry": "Fintech"
-    }
-  },
-
   "template_info": {
     "template_id": "T_EMPLOYER_STD_V3",
     "name": "Professional Employer Standard",

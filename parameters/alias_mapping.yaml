@@ -1,0 +1,241 @@
+skill_aliases:
+  # ==========================================
+  # AI / Machine Learning / Data Science
+  # ==========================================
+  ml: "machine learning"
+  ai: "artificial intelligence"
+  nlp: "natural language processing"
+  cv: "computer vision"
+  dl: "deep learning"
+  ds: "data science"
+  nn: "neural networks"
+  dnn: "deep neural networks"
+  cnn: "convolutional neural networks"
+  rnn: "recurrent neural networks"
+  gan: "generative adversarial networks"
+  rl: "reinforcement learning"
+  llm: "large language models"
+  genai: "generative ai"
+
+  # ==========================================
+  # Programming Languages
+  # ==========================================
+  py: "python"
+  js: "javascript"
+  ts: "typescript"
+  cpp: "c++"
+  cs: "c#"
+  rb: "ruby"
+  go: "golang"
+  kt: "kotlin"
+  rs: "rust"
+
+  # Common variations
+  python3: "python"
+  python2: "python"
+  javascript es6: "javascript"
+  ecmascript: "javascript"
+  node: "node.js"
+  nodejs: "node.js"
+
+  # ==========================================
+  # Web Development
+  # ==========================================
+  html5: "html"
+  css3: "css"
+  scss: "sass"
+
+  # Frontend Frameworks
+  reactjs: "react"
+  react.js: "react"
+  vue: "vue.js"
+  vuejs: "vue.js"
+  angularjs: "angular"
+  ng: "angular"
+  next: "next.js"
+  nextjs: "next.js"
+  nuxt: "nuxt.js"
+  nuxtjs: "nuxt.js"
+
+  # Backend Frameworks
+  express: "express.js"
+  expressjs: "express.js"
+  spring: "spring boot"
+  springboot: "spring boot"
+  rails: "ruby on rails"
+  ror: "ruby on rails"
+  dotnet: ".net"
+  .net core: ".net"
+
+  # ==========================================
+  # Mobile Development
+  # ==========================================
+  ios dev: "ios development"
+  android dev: "android development"
+  rn: "react native"
+
+  # ==========================================
+  # Databases
+  # ==========================================
+  rdbms: "relational databases"
+  db: "databases"
+
+  # Relational
+  postgres: "postgresql"
+  mssql: "sql server"
+  oracle db: "oracle"
+
+  # NoSQL
+  mongo: "mongodb"
+  es: "elasticsearch"
+
+  # ==========================================
+  # Cloud Platforms
+  # ==========================================
+  aws: "amazon web services"
+  gcp: "google cloud platform"
+  azure: "microsoft azure"
+
+  # AWS Services
+  ec2: "amazon ec2"
+  s3: "amazon s3"
+  rds: "amazon rds"
+  lambda: "aws lambda"
+  cloudfront: "aws cloudfront"
+
+  # ==========================================
+  # DevOps / Infrastructure / Containers
+  # ==========================================
+  k8s: "kubernetes"
+  cicd: "ci/cd"
+
+  # ==========================================
+  # Version Control
+  # ==========================================
+  svn: "subversion"
+
+  # ==========================================
+  # Testing
+  # ==========================================
+  qa: "quality assurance"
+  tdd: "test-driven development"
+  bdd: "behavior-driven development"
+  e2e: "end-to-end testing"
+
+  # ==========================================
+  # API & Protocols
+  # ==========================================
+  rest: "rest api"
+  restful: "rest api"
+
+  # ==========================================
+  # Data Engineering & Big Data
+  # ==========================================
+  spark: "apache spark"
+  kafka: "apache kafka"
+  airflow: "apache airflow"
+  flink: "apache flink"
+  hive: "apache hive"
+  pig: "apache pig"
+
+  # ==========================================
+  # Business Intelligence & Analytics
+  # ==========================================
+  bi: "business intelligence"
+  powerbi: "power bi"
+
+  # ==========================================
+  # Data Science Tools
+  # ==========================================
+  sklearn: "scikit-learn"
+
+  # ML Frameworks
+  tf: "tensorflow"
+  torch: "pytorch"
+
+  # ==========================================
+  # Security
+  # ==========================================
+  infosec: "information security"
+  appsec: "application security"
+  netsec: "network security"
+  iam: "identity and access management"
+  sso: "single sign-on"
+  jwt: "json web tokens"
+  pen testing: "penetration testing"
+
+  # ==========================================
+  # Enterprise / ERP / CRM
+  # ==========================================
+  erp: "enterprise resource planning"
+  crm: "customer relationship management"
+
+  # ==========================================
+  # Design & UI/UX
+  # ==========================================
+  ui: "user interface"
+  ux: "user experience"
+  ui/ux: "ui/ux design"
+  xd: "adobe xd"
+  ps: "adobe photoshop"
+
+  # ==========================================
+  # Content Management Systems
+  # ==========================================
+  cms: "content management system"
+  wp: "wordpress"
+
+  # ==========================================
+  # Project Management Tools
+  # ==========================================
+  ms teams: "microsoft teams"
+
+  # ==========================================
+  # Monitoring & Observability
+  # ==========================================
+  apm: "application performance monitoring"
+  elk: "elk stack"
+
+  # ==========================================
+  # Networking
+  # ==========================================
+  lan: "local area network"
+  wan: "wide area network"
+  cdn: "content delivery network"
+
+  # ==========================================
+  # Operating Systems
+  # ==========================================
+  rhel: "red hat enterprise linux"
+  mac os: "macos"
+
+  # ==========================================
+  # Blockchain & Web3
+  # ==========================================
+  defi: "decentralized finance"
+
+  # ==========================================
+  # IoT
+  # ==========================================
+  iot: "internet of things"
+
+  # ==========================================
+  # Game Development
+  # ==========================================
+  unreal: "unreal engine"
+  ue4: "unreal engine"
+  ue5: "unreal engine"
+
+  # ==========================================
+  # Other Common Abbreviations
+  # ==========================================
+  sdk: "software development kit"
+  ide: "integrated development environment"
+  cli: "command line interface"
+  gui: "graphical user interface"
+  orm: "object-relational mapping"
+  mvc: "model-view-controller"
+  mvvm: "model-view-viewmodel"
+  spa: "single page application"
+  pwa: "progressive web app"
+  seo: "search engine optimization"

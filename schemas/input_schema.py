@@ -10,10 +10,9 @@ designed to be:
 
 from datetime import date
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, EmailStr, Field, HttpUrl, field_validator
-
+from pydantic import BaseModel, EmailStr, Field, HttpUrl, field_validator, model_validator
 
 class SkillLevel(str, Enum):
     """Normalized skill proficiency levels used across the platform.
@@ -43,6 +42,21 @@ class Language(str, Enum):
     TH = "th"
 
 
+class LanguageTone(str, Enum):
+    """Supported tone styles for generated CV text.
+
+    Controls:
+    - Wording style for all sections (profile summary, experience, etc.)
+    - Prompt instructions given to the LLM
+    """
+
+    FORMAL = "formal"
+    NEUTRAL = "neutral"
+    ACADEMIC = "academic"
+    FUNNY = "funny"
+    CASUAL = "casual"
+
+
 class PersonalInfo(BaseModel):
     """Minimal personal contact information for a student.
 
@@ -70,6 +84,15 @@ class PersonalInfo(BaseModel):
         cleaned = re.sub(r"[\x00-\x1F\x7F-\x9F]", "", v)
         return cleaned.strip()
 
+    @field_validator("phone")
+    @classmethod
+    def normalize_phone(cls, v: str | None) -> str | None:
+        """Trim whitespace; treat empty strings as None for consistency."""
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
+
 
 class Education(BaseModel):
     """Formal education entry for the student.
@@ -91,6 +114,12 @@ class Education(BaseModel):
     graduation_date: date | None
     major: str | None = Field(None, max_length=200)
 
+    @model_validator(mode="after")
+    def validate_dates(self) -> "Education":
+        """Ensure graduation_date is not earlier than start_date, if provided."""
+        if self.graduation_date and self.graduation_date < self.start_date:
+            raise ValueError("graduation_date cannot be earlier than start_date")
+        return self
 
 class Experience(BaseModel):
     """Work or internship experience entry.
@@ -113,7 +142,7 @@ class Experience(BaseModel):
     company: str = Field(..., min_length=1, max_length=200)
     start_date: date
     end_date: date | None
-    responsibilities: list[str] = Field(..., min_length=1, max_length=10)
+    responsibilities: list[str] = Field(..., min_length=1, max_length=10) # Must include at least one responsibility
 
     @field_validator("responsibilities")
     @classmethod
@@ -127,6 +156,13 @@ class Experience(BaseModel):
             normalized.append(text[:500])
         # Let pydantic enforce min_length=1 if all were empty
         return normalized
+
+    @model_validator(mode="after")
+    def validate_end_date(self) -> "Experience":
+        """Ensure end_date is not earlier than start_date, if provided."""
+        if self.end_date and self.end_date < self.start_date:
+            raise ValueError("end_date cannot be earlier than start_date")
+        return self
 
 
 class Skill(BaseModel):
@@ -187,6 +223,44 @@ class Extracurricular(BaseModel):
     duration: str = Field(..., max_length=100)
     description: str | None = Field(None, max_length=500)
 
+class Publication(BaseModel):
+    """Academic or professional publication."""
+
+    id: str = Field(..., pattern=r"^pub#[a-zA-Z0-9_-]+$")
+    title: str = Field(..., max_length=300)
+    venue: str | None = Field(None, max_length=200)  # journal / conference / media
+    year: int | None = Field(None, ge=1900, le=2100)
+    link: HttpUrl | None = None
+    description: str | None = Field(None, max_length=500)
+
+
+class Training(BaseModel):
+    """Course, bootcamp, or professional training."""
+
+    id: str = Field(..., pattern=r"^training#[a-zA-Z0-9_-]+$")
+    title: str = Field(..., max_length=200)
+    provider: str | None = Field(None, max_length=200)
+    training_date: date | None = None
+    description: str | None = Field(None, max_length=500)
+
+
+class Reference(BaseModel):
+    """Professional or academic reference contact."""
+    id: str = Field(..., pattern=r"^ref#[a-zA-Z0-9_-]+$")
+    name: str = Field(..., max_length=200)
+    title: str | None = Field(None, max_length=200)
+    company: str | None = Field(None, max_length=200)
+    email: EmailStr | None = None
+    phone: str | None = Field(None, max_length=50)
+    relationship: str | None = Field(None, max_length=200)
+    note: str | None = Field(None, max_length=300)
+
+
+class AdditionalInfoItem(BaseModel):
+    """Catch-all extra information as key-value items."""
+    id: str = Field(..., pattern=r"^add#[a-zA-Z0-9_-]+$")
+    label: str = Field(..., max_length=100)   # e.g. 'Nationality', 'Languages', 'Interests'
+    value: str = Field(..., max_length=300)
 
 class StudentProfile(BaseModel):
     """Aggregated, sanitized student profile used as LLM ground truth.
@@ -194,7 +268,7 @@ class StudentProfile(BaseModel):
     This is the main data package passed (in structured form) to the LLM:
     - Enforces minimum evidence:
         * ≥1 education entry
-        * ≥3 skills
+        * ≥2 skills
     - Caps list sizes to keep prompts small and predictable:
         * education: up to 5 entries
         * experience: up to 10 entries
@@ -206,10 +280,16 @@ class StudentProfile(BaseModel):
     personal_info: PersonalInfo
     education: list[Education] = Field(..., min_length=1, max_length=5)
     experience: list[Experience] = Field(default_factory=list, max_length=10)
-    skills: list[Skill] = Field(..., min_length=3, max_length=30)
+    skills: list[Skill] = Field(..., min_length=1, max_length=30)
     awards: list[Award] = Field(default_factory=list, max_length=10)
     extracurriculars: list[Extracurricular] = Field(default_factory=list, max_length=10)
 
+    publications: list[Publication] = Field(default_factory=list, max_length=10)
+    training: list[Training] = Field(default_factory=list, max_length=10)
+    references: list[Reference] = Field(default_factory=list, max_length=5)
+    additional_info: list[AdditionalInfoItem] = Field(default_factory=list, max_length=10)
+
+    # Reject unexpected fields at this level (matches "no extra fields" design goal)
     model_config = {"extra": "forbid"}
 
 
@@ -264,6 +344,61 @@ class JobTaxonomy(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class UserInputSkillItem(BaseModel):
+    """User-provided skill override for the CV text."""
+    name: str | None = Field(None, max_length=100)
+    level: str | None = Field(None, max_length=50)
+    model_config = {"extra": "forbid"}
+
+
+class UserInputExperienceItem(BaseModel):
+    """User-provided experience override for the CV text."""
+    title: str | None = Field(None, max_length=200)
+    company: str | None = Field(None, max_length=200)
+    period: str | None = Field(None, max_length=100)
+    highlights: list[str] | None = Field(None)
+
+    @field_validator("highlights")
+    @classmethod
+    def normalize_highlights(cls, v: list[str] | None) -> list[str] | None:
+        """Trim whitespace and cap highlight length."""
+        if not v:
+            return v
+        normalized: list[str] = []
+        for h in v:
+            text = (h or "").strip()
+            if not text:
+                continue
+            normalized.append(text[:500])
+        return normalized
+
+    model_config = {"extra": "forbid"}
+
+
+class UserInputEducationItem(BaseModel):
+    """User-provided education override for the CV text."""
+    degree: str | None = Field(None, max_length=200)
+    institution: str | None = Field(None, max_length=200)
+    location: str | None = Field(None, max_length=200)
+    model_config = {"extra": "forbid"}
+
+
+class UserInputCVTextBySection(BaseModel):
+    """Optional user-provided overrides for CV sections.
+
+    Every field is optional. If a value is None or empty, the pipeline
+    will fall back to structured profile data.
+    """
+
+    profile_summary: str | None = Field(None, max_length=2000)
+    skills: list[UserInputSkillItem] | None = None
+    experience: list[UserInputExperienceItem] | None = None
+    education: list[UserInputEducationItem] | None = None
+
+    # Allows only known keys; prevents user sending arbitrary dicts.
+    model_config = {"extra": "forbid"}
+
+
 class CVGenerationRequest(BaseModel):
     """Top-level CV generation request payload.
 
@@ -271,6 +406,7 @@ class CVGenerationRequest(BaseModel):
     It bundles:
     - `user_id`: platform user identifier (no PII, just a stable key)
     - `language`: desired output language (EN/TH)
+    - `language_tone`: desired tone style (formal, neutral, academic, funny)
     - `template_id`: which CV template style to use
     - `sections`: which CV sections to generate in this call
     - `student_profile`: ground-truth data for the student
@@ -285,6 +421,7 @@ class CVGenerationRequest(BaseModel):
 
     user_id: str = Field(..., pattern=r"^[A-Za-z0-9_-]+$", max_length=50)
     language: Language = Language.EN
+    language_tone: LanguageTone = LanguageTone.FORMAL
     template_id: str = Field(
         default="T_EMPLOYER_STD_V3", pattern=r"^T_[A-Z_]+_V\d+$"
     )
@@ -300,6 +437,10 @@ class CVGenerationRequest(BaseModel):
             "extracurricular",
             "volunteering",
             "interests",
+            "publications",
+            "training",
+            "references",
+            "additional_info",
         ]
     ] = Field(
         default=[
@@ -314,9 +455,25 @@ class CVGenerationRequest(BaseModel):
         max_length=10,
     )
     student_profile: StudentProfile
+
+    # Optional user-provided overrides for specific CV sections
+    user_input_cv_text_by_section: dict[str, Any] | None = None
     # Optional generic role-level context (job family)
     target_role_taxonomy: RoleTaxonomy | None = None
-    # Required JD-level context for this generation request
-    target_jd_taxonomy: JobTaxonomy
+    # Optional context for this generation request (normalized JD)
+    target_jd_taxonomy: JobTaxonomy | None = None
 
+    # Reject unexpected fields at the top-level request
     model_config = {"extra": "forbid"}
+
+    @field_validator("sections")
+    @classmethod
+    def deduplicate_sections(cls, sections: list[str]) -> list[str]:
+        """Ensure sections list has no duplicates while preserving order."""
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for s in sections:
+            if s not in seen:
+                seen.add(s)
+                deduped.append(s)
+        return deduped
