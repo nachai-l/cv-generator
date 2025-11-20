@@ -10,11 +10,11 @@ This module is responsible for:
 Supported input formats:
 
 1) Legacy / internal shape (still valid):
-   - request.profile_info          (required)
-   - request.job_role_info         (optional)
-   - request.job_position_info     (optional)
-   - request.company_info          (optional)
-   - request.template_info         (required)
+   - request.profile_info                  (required)
+   - request.job_role_info                 (optional)
+   - request.job_position_info             (optional)
+   - request.company_info                  (optional)
+   - request.template_info                 (required)
    - request.user_input_cv_text_by_section (optional)
 
 2) New public API shape (CVGenerationRequest from schemas.input_schema):
@@ -24,6 +24,14 @@ Supported input formats:
    - request.template_id           (required → part of template_info)
    - request.sections              (required → part of template_info)
    - request.language              (used to enrich template_info)
+   - request.language_tone         (optional → used to steer writing style in downstream stages)
+
+Notes:
+- Stage A is schema-agnostic in the sense that it reads a "profile-like" and
+  "template-like" view, regardless of whether the caller is legacy or using
+  CVGenerationRequest.
+- Schema-level rules (e.g. additional_info.id pattern, value vs content) are
+  enforced in CVGenerationRequest; Stage A works on the already-validated model.
 """
 
 from __future__ import annotations
@@ -45,17 +53,54 @@ logger = structlog.get_logger()
 
 
 class GuardrailsProcessor:
-    """Handles Stage A processing: validation, sanitization, and profile assembly."""
+    """
+    Encapsulates Stage A logic:
+    - Security scanning (prompt-injection detection)
+    - Sanitization of user-controlled fields
+    - Baseline completeness validation (profile, JD, template)
+    - Shape normalization for downstream stages
+    - Evidence plan construction from the profile & user drafts
+    """
 
-    def __init__(self) -> None:
+    def __init__(self, validation_config: dict[str, Any] | None = None) -> None:
+        # Bind logger with stage so all logs are tagged consistently
         self.logger = logger.bind(stage="A_guardrails")
 
+        # Default validation config, aligned with parameters.yaml
+        default_validation_config: dict[str, Any] = {
+            "min_skills_required": 3,
+            "min_education_required": 0,      # 0 = no requirement
+            "require_email": True,
+            "require_name": True,
+            "max_section_chars_default": 2500,
+            "drop_empty_sections": True,
+            "enable_safety_cleaning": True,
+            "max_skills": 50,
+            "strict_mode": True,
+        }
+
+        # Allow overrides from the actual parameters.yaml loader
+        if validation_config:
+            default_validation_config.update(validation_config)
+
+        self.validation_config = default_validation_config
+        self.logger.info(
+            "guardrails_config_loaded",
+            validation_config=self.validation_config,
+        )
     # -------------------------------------------------------------------------
     # Helper: user_id resolution
     # -------------------------------------------------------------------------
     @staticmethod
     def _get_user_id(request: Any) -> str:
-        """Extract user_id from either top-level request or profile_info."""
+        """
+        Extract a user identifier from the request for logging.
+
+        Priority:
+        1. request.user_id
+        2. request.profile_info.user_id (legacy)
+        3. "unknown" fallback
+        """
         uid = getattr(request, "user_id", None)
         if not uid:
             profile = getattr(request, "profile_info", None)
@@ -71,10 +116,11 @@ class GuardrailsProcessor:
         """
         Return a profile-like object for validation/evidence.
 
-        For new API:
+        New API:
           - prefer request.student_profile (richer Pydantic model)
-        For legacy:
-          - fall back to request.profile_info
+
+        Legacy:
+          - fall back to request.profile_info (already-normalized view)
         """
         # New API shape (preferred for validation/evidence)
         student_profile = getattr(request, "student_profile", None)
@@ -95,6 +141,7 @@ class GuardrailsProcessor:
 
         Prefers:
           - request.template_info (legacy; may already include max_chars_per_section)
+
         Falls back to a lightweight view built from:
           - request.template_id
           - request.sections
@@ -113,7 +160,8 @@ class GuardrailsProcessor:
         if not template_id:
             return None
 
-        # SimpleNamespace gives us attribute-style access compatible with _validate_template_info
+        # SimpleNamespace gives us attribute-style access compatible
+        # with _validate_template_info, without needing a dedicated model.
         language = getattr(request, "language", None)
         lang_value = getattr(language, "value", None) if language is not None else None
 
@@ -168,6 +216,7 @@ class GuardrailsProcessor:
         if student_profile is None:
             return request
 
+        # Pull a minimal personal_info snapshot
         personal = getattr(student_profile, "personal_info", None)
         name = getattr(personal, "name", None) if personal is not None else None
         email = getattr(personal, "email", None) if personal is not None else None
@@ -195,7 +244,7 @@ class GuardrailsProcessor:
                         "name": getattr(s, "name", None),
                     }
                     level = getattr(s, "level", None)
-                    # Handle Enum
+                    # Handle Enum or plain string
                     if level is not None:
                         if hasattr(level, "value"):
                             skill_dict["level"] = level.value
@@ -203,12 +252,13 @@ class GuardrailsProcessor:
                             skill_dict["level"] = level
                     profile_info["skills"].append(skill_dict)
         except Exception:
-            # Best-effort only
+            # Best-effort only; failure here must not break the request.
             pass
 
         # Attach without fighting pydantic's extra="forbid"
         try:
             if isinstance(request, BaseModel):
+                # Bypass pydantic validation to attach a convenience attribute
                 object.__setattr__(request, "profile_info", profile_info)
             else:
                 setattr(request, "profile_info", profile_info)
@@ -224,7 +274,22 @@ class GuardrailsProcessor:
     # Public API
     # -------------------------------------------------------------------------
     def validate_and_sanitize(self, request: CVGenerationRequest | Any) -> ValidationResult:
-        """Validate the incoming request, scan for injection, and sanitize inputs."""
+        """
+        Main Stage A entrypoint.
+
+        Steps:
+        1. Security scan for prompt-injection patterns (raw payload inspection)
+        2. Sanitization (strip control chars, normalize whitespace, etc.)
+        3. Shape normalization for downstream (ensure profile_info exists)
+        4. Baseline validation of profile, template_info, and JD/role info
+        5. Section-level warnings based on available data
+
+        Returns:
+            ValidationResult with:
+            - is_valid: bool
+            - errors: List[str]
+            - warnings: List[str]
+        """
         uid = self._get_user_id(request)
         self.logger.info("starting_validation", user_id=uid)
 
@@ -235,11 +300,9 @@ class GuardrailsProcessor:
         # Step 1: Prompt injection / security scan (on raw payload)
         # ------------------------------------------------------------------
         if hasattr(request, "model_dump"):
-            raw_payload = request.model_dump(mode="python")  # type: ignore[call-arg]
-        elif hasattr(request, "dict"):
-            raw_payload = request.model_dump()  # type: ignore[call-arg]
+            raw_payload = request.model_dump(mode="python")  # pydantic v2
         else:
-            raw_payload = request
+            raw_payload = request  # plain dict or already-raw object
 
         injection_result = scan_dict_for_injection(raw_payload)
 
@@ -371,7 +434,15 @@ class GuardrailsProcessor:
         return ValidationResult(is_valid=True, warnings=warnings)
 
     def build_evidence_plan(self, request: CVGenerationRequest | Any) -> EvidencePlan:
-        """Extract facts from the sanitized profile to build an evidence base."""
+        """
+        Construct an EvidencePlan (facts + section_hints) from the profile
+        and user-supplied drafts.
+
+        This is the main input into Stage B prompts. It is designed to be:
+        - Cheap to compute
+        - Stable across legacy/new API shapes
+        - Extensible when new sections are added to the profile schema
+        """
         uid = self._get_user_id(request)
         self.logger.info("building_evidence_plan", user_id=uid)
 
@@ -695,6 +766,119 @@ class GuardrailsProcessor:
             section_hints["certifications"] = cert_ids
 
         # ------------------------------
+        # Publications (structured)
+        # ------------------------------
+        publication_ids: List[str] = []
+        for idx, pub in enumerate(getattr(profile, "publications", []) or []):
+            pub_id = getattr(pub, "id", None) or f"publication_{idx}"
+            title = getattr(pub, "title", "") or getattr(pub, "name", "")
+            venue = (
+                getattr(pub, "venue", None)
+                or getattr(pub, "journal", None)
+                or getattr(pub, "conference", None)
+            )
+            year = getattr(pub, "year", None)
+
+            fact = f"Publication: {title}".strip()
+            if venue:
+                fact += f" in {venue}"
+            if year:
+                fact += f" ({year})"
+
+            evidences.append(
+                Evidence(
+                    evidence_id=pub_id,
+                    fact=fact,
+                    source_type="publication",
+                )
+            )
+            publication_ids.append(pub_id)
+
+        if publication_ids:
+            section_hints["publications"] = publication_ids
+
+        # ------------------------------
+        # Training (structured)
+        # ------------------------------
+        training_ids: List[str] = []
+        for idx, tr in enumerate(getattr(profile, "training", []) or []):
+            tr_id = getattr(tr, "id", None) or f"training_{idx}"
+            title = getattr(tr, "title", "") or getattr(tr, "name", "")
+            provider = getattr(tr, "provider", None) or getattr(tr, "organization", None)
+            fact = f"Completed training: {title}".strip()
+            if provider:
+                fact += f" by {provider}"
+            if getattr(tr, "description", None):
+                fact += f" – {tr.description[:100]}..."
+
+            evidences.append(
+                Evidence(
+                    evidence_id=tr_id,
+                    fact=fact,
+                    source_type="training",
+                )
+            )
+            training_ids.append(tr_id)
+
+        if training_ids:
+            section_hints["training"] = training_ids
+
+        # ------------------------------
+        # References (structured)
+        # ------------------------------
+        reference_ids: List[str] = []
+        for idx, ref in enumerate(getattr(profile, "references", []) or []):
+            ref_id = getattr(ref, "id", None) or f"reference_{idx}"
+            name = getattr(ref, "name", "")
+            relationship = getattr(ref, "relationship", None)
+            company = getattr(ref, "company", None) or getattr(ref, "organization", None)
+
+            fact = f"Reference: {name}".strip()
+            if relationship:
+                fact += f" ({relationship})"
+            if company:
+                fact += f" at {company}"
+
+            evidences.append(
+                Evidence(
+                    evidence_id=ref_id,
+                    fact=fact,
+                    source_type="reference",
+                )
+            )
+            reference_ids.append(ref_id)
+
+        if reference_ids:
+            section_hints["references"] = reference_ids
+
+        # ------------------------------
+        # Additional Info (structured)
+        # ------------------------------
+        add_info_ids: List[str] = []
+        for idx, item in enumerate(getattr(profile, "additional_info", []) or []):
+            item_id = getattr(item, "id", None) or f"additional_info_{idx}"
+            label = getattr(item, "label", "") or "Additional info"
+            value = getattr(item, "value", "")  # schema enforces `value`, not `content`
+
+            preview = (value or "").strip()
+            if len(preview) > 160:
+                preview = preview[:160] + "..."
+
+            fact = f"{label}: {preview}"
+            evidences.append(
+                Evidence(
+                    evidence_id=item_id,
+                    fact=fact,
+                    source_type="additional_info",
+                )
+            )
+            add_info_ids.append(item_id)
+
+        if add_info_ids:
+            section_hints["additional_info"] = add_info_ids
+
+
+        # ------------------------------
         # Interests (drafts only – cheap but useful)
         # ------------------------------
         draft_interests = drafts.get("interests")
@@ -730,7 +914,13 @@ class GuardrailsProcessor:
     # -------------------------------------------------------------------------
     @staticmethod
     def _apply_sanitized_payload(request: Any, sanitized_payload: dict[str, Any]) -> None:
-        """Apply sanitized dict back onto the request model (best-effort, in-place)."""
+        """
+        Apply sanitized dict back onto the request object (best-effort, in-place).
+
+        This is only used for non-Pydantic inputs; for Pydantic models we keep
+        the original instance and use the sanitized payload purely for logging
+        and security decisions.
+        """
         for field_name, value in sanitized_payload.items():
             try:
                 setattr(request, field_name, value)
@@ -738,34 +928,62 @@ class GuardrailsProcessor:
                 continue
 
     # ---- Validation helpers ------------------------------------------------
-    @staticmethod
-    def _validate_profile(profile: Any) -> Tuple[List[str], List[str]]:
-        """Validate baseline completeness of the profile block."""
+    def _validate_profile(self, profile: Any) -> Tuple[List[str], List[str]]:
+        """
+        Validate baseline completeness of the profile block.
+
+        Rules are driven by parameters.yaml → validation section:
+        - require_name / require_email
+        - min_education_required (0 = no education requirement)
+        - min_skills_required
+        """
         errors: List[str] = []
         warnings: List[str] = []
 
+        cfg = self.validation_config
+        min_edu = cfg.get("min_education_required", 0)
+        min_skills = cfg.get("min_skills_required", 3)
+        require_email = cfg.get("require_email", True)
+        require_name = cfg.get("require_name", True)
+
+        # Support both profile.personal_info.{name,email} and flat profile.{name,email}
         personal = getattr(profile, "personal_info", None) or profile
         name = getattr(personal, "name", "").strip()
         email = getattr(personal, "email", "")
 
-        if not name:
+        if require_name and not name:
             errors.append("Personal info: name is required.")
-        if not email:
+        if require_email and not email:
             errors.append("Personal info: email is required.")
 
+        # Education: configurable minimum (0 → no requirement)
         education = getattr(profile, "education", []) or []
-        if not education:
-            errors.append("At least one education entry is required.")
+        if min_edu and len(education) < min_edu:
+            if min_edu == 1:
+                errors.append("At least one education entry is required.")
+            else:
+                errors.append(f"At least {min_edu} education entries are required.")
 
+        # Skills: configurable minimum
         skills = getattr(profile, "skills", []) or []
-        if len(skills) < 3:
-            errors.append("At least 3 skills are required.")
+        if min_skills and len(skills) < min_skills:
+            if min_skills == 1:
+                errors.append("At least 1 skill is required.")
+            else:
+                errors.append(f"At least {min_skills} skills are required.")
 
         return errors, warnings
 
+
     @staticmethod
     def _validate_template_info(template_info: Any) -> Tuple[List[str], List[str]]:
-        """Validate the template configuration (supports multiple naming variants)."""
+        """
+        Validate the template configuration (supports multiple naming variants).
+
+        Requirements:
+        - template_id must be present
+        - At least one section must be defined (via max_chars_per_section, sections, etc.)
+        """
         errors: List[str] = []
         warnings: List[str] = []
 
@@ -785,7 +1003,13 @@ class GuardrailsProcessor:
 
     @staticmethod
     def _validate_jd_taxonomy(jd: Any) -> Tuple[List[str], List[str]]:
-        """Validate basic completeness of job role / position info."""
+        """
+        Validate basic completeness of job role / position info.
+
+        Currently:
+        - Warn if no required skills
+        - Warn if no role title
+        """
         errors: List[str] = []
         warnings: List[str] = []
 
@@ -809,7 +1033,15 @@ class GuardrailsProcessor:
 
     @staticmethod
     def _validate_requested_sections(requested_sections: List[str], available_sections: Set[str]) -> List[str]:
-        """Check that requested sections are supported by profile data."""
+        """
+        Check that requested sections are supported by profile data.
+
+        Emits warnings (not errors) when:
+        - a requested section has no corresponding data in the profile
+
+        Certain sections (e.g. profile_summary, interests) are always allowed
+        because they can be synthesized even without explicit structured data.
+        """
         warnings: List[str] = []
         always_allowed = {"profile_summary", "interests"}
 
@@ -825,12 +1057,31 @@ class GuardrailsProcessor:
 
     @staticmethod
     def _get_available_sections(profile: Any) -> Set[str]:
-        """Determine which sections have data available on the profile."""
+        """
+        Determine which sections have data available on the profile.
+
+        Used to generate warnings for requested sections that have no backing data.
+        """
         available: Set[str] = {"profile_summary", "education", "skills"}
+
         if getattr(profile, "experience", []):
             available.add("experience")
         if getattr(profile, "awards", []):
             available.add("awards")
         if getattr(profile, "extracurriculars", []):
             available.add("extracurricular")
+        if getattr(profile, "projects", []):
+            available.add("projects")
+        if getattr(profile, "certifications", []):
+            available.add("certifications")
+        if getattr(profile, "publications", []):
+            available.add("publications")
+        if getattr(profile, "training", []):
+            available.add("training")
+        if getattr(profile, "references", []):
+            available.add("references")
+        if getattr(profile, "additional_info", []):
+            available.add("additional_info")
+
         return available
+

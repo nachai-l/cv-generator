@@ -4,6 +4,30 @@ These models are not part of the external API contract. They are used
 to structure internal signals (e.g., prompt injection detection results),
 validation outcomes, and evidence planning in a consistent, type-safe way
 across services.
+
+**Skills Handling Philosophy:**
+
+The skills system enforces a "canonical source of truth" principle:
+
+1. **Stage A** extracts canonical skills from profile_info/student_profile and
+   creates a SkillsSectionPlan with immutable name+level pairs.
+
+2. **Stage B** generates structured skills via LLM, then:
+   - Deduplicates by name only (case-insensitive)
+   - Uses fuzzy matching + alias maps to snap similar names to canonical forms
+   - Reconciles levels: any skill matching a canonical name gets its level
+     restored to the canonical value (LLM cannot change taxonomy levels)
+   - Optionally preserves all canonical skills (dropping_irrelevant_skills=False)
+
+3. **Stage C** validates and deduplicates again (aligned with Stage B):
+   - Deduplicates by name only (one record per skill name)
+   - Never overwrites canonical levels coming from Stage B
+   - Does not modify levels; the first occurrence for each name is kept
+
+This ensures:
+- **Name consistency**: Fuzzy variants map to canonical names
+- **Level integrity**: Taxonomy levels are never silently downgraded
+- **Single source of truth**: One canonical record per skill name
 """
 
 from __future__ import annotations
@@ -58,8 +82,6 @@ class InjectionDetectionResult(BaseModel):
         cls, values: "InjectionDetectionResult"
     ) -> "InjectionDetectionResult":
         """Ensure is_safe is consistent with risk_score if not already enforced upstream."""
-        # If upstream logic wants a different boundary, it can still override is_safe explicitly.
-        # Here we only force consistency for obviously invalid combinations.
         if values.risk_score >= 0.8 and values.is_safe:
             # High-risk results should never be marked safe.
             values.is_safe = False
@@ -206,16 +228,18 @@ class EvidencePlan(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Skills guardrail models (taxonomy-preserving)
+# Skills guardrail models (taxonomy-preserving, Stage A/B-centric)
 # ---------------------------------------------------------------------------
 
 
 class CanonicalSkill(BaseModel):
     """Canonical representation of a skill from the internal taxonomy.
 
-    This is derived from profile_info + the skills taxonomy during Stage A.
+    This is derived from profile_info + the skills taxonomy during Stage A
+    and consumed primarily in Stage B's structured-skills pipeline.
+
     Downstream stages MUST treat `name` as immutable and only reorder or
-    drop skills; renaming is not allowed.
+    drop skills; renaming is not allowed at the business-logic level.
 
     Attributes:
         name:
@@ -243,15 +267,19 @@ class SkillSelectionItem(BaseModel):
     The LLM is allowed to:
       - reorder skills,
       - set `keep = false` to drop a skill,
-      - optionally adjust `level` (if permitted by business rules).
+      - optionally adjust `level` (subject to business rules and canonical
+        level protection in Stage B).
 
-    The LLM is *not* allowed to rename skills: Stage C will validate that
-    each `name` matches a known CanonicalSkill or an allowed additional skill.
+    The LLM is *not* supposed to rename skills: Stage B enforces that the
+    final structured skills list remains aligned with known canonical skills
+    (or an allowed additional skill whitelist). Stage C then performs only
+    light normalization (name-stripping, dedup by name, capping), without
+    re-running taxonomy checks.
     """
 
     name: str = Field(
         ...,
-        description="Canonical skill name; must exactly match a taxonomy skill.",
+        description="Canonical or allowed additional skill name.",
     )
     level: str | None = Field(
         default=None,
@@ -279,6 +307,14 @@ class SkillsSectionPlan(BaseModel):
     """Internal plan for enforcing taxonomy-preserving skills generation.
 
     Built in Stage A from profile_info + taxonomy and passed to Stage B/C.
+
+    Current usage:
+      - Stage A builds `canonical_skills` and `allowed_additional_skills`.
+      - Stage B uses this to drive structured skills generation and canonical
+        matching (including alias-based matching and dropping irrelevant skills).
+      - Stage C assumes names are already canonicalized and focuses on light
+        cleanup (normalize, dedup by name, cap list size, fallback from
+        original request if needed).
 
     Attributes:
         canonical_skills:

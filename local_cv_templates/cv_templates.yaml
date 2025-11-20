@@ -14,6 +14,10 @@ T_EMPLOYER_STD_V3:
     - "extracurricular"
     - "volunteering"
     - "interests"
+    - "publications"
+    - "training"
+    - "references"
+    - "additional_info"
   color_scheme:
     primary: "#2C3E50"
     secondary: "#3498DB"
@@ -45,6 +49,10 @@ T_MINIMALIST_V1:
     - "skills"
     - "awards"
     - "interests"
+    - "publications"
+    - "training"
+    - "references"
+    - "additional_info"
   color_scheme:
     primary: "#000000"
     secondary: "#333333"
@@ -61,6 +69,10 @@ T_MINIMALIST_V1:
     skills: 1200
     awards: 1000
     interests: 600
+    publications: 3000
+    training: 2000
+    references: 1000
+    additional_info: 2000
 
 T_CREATIVE_V1:
   name: "Creative Tech"
@@ -73,6 +85,10 @@ T_CREATIVE_V1:
     - "education"
     - "extracurricular"
     - "interests"
+    - "publications"
+    - "training"
+    - "references"
+    - "additional_info"
   color_scheme:
     primary: "#6C63FF"
     secondary: "#FF6584"
@@ -90,3 +106,7 @@ T_CREATIVE_V1:
     education: 2500
     extracurricular: 2500
     interests: 800
+    publications: 4000
+    training: 2000
+    references: 1500
+    additional_info: 2000

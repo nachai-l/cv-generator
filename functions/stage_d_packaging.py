@@ -8,9 +8,11 @@ This module is the final packaging layer of the CV Generation pipeline.
 Responsibilities:
 - Take validated CV output from Stage C (CVGenerationResponse).
 - Enrich metadata with timing, token usage, cost, and profile header info.
-- Normalize and construct error responses (ErrorResponse).
-- Attach/propagate a request_id for observability and HTTP headers.
-- Stay HTTP-agnostic so FastAPI (or any other framework) can use it directly.
+- Attach / propagate request_id and user_id for observability.
+- Mark pipeline completion flags (e.g., stage_d_completed) without mutating
+  sections or skills that were already finalized in Stage C.
+- Normalize and construct error responses (ErrorResponse) in a way that is
+  HTTP-agnostic so FastAPI (or any other framework) can use it directly.
 """
 
 from __future__ import annotations
@@ -41,7 +43,8 @@ class LLMUsageSummary:
     Aggregated LLM usage stats for a single CV generation pipeline run.
 
     This should be created upstream (e.g., in llm_metrics or the orchestrator)
-    and passed into Stage D. Stage D only consumes it to update metadata.
+    and passed into Stage D. Stage D only consumes it to update metadata
+    and logs; it does not call any LLMs itself.
     """
 
     model: str = "unknown"
@@ -97,15 +100,19 @@ def finalize_cv_response(
     Finalize and enrich a successful CVGenerationResponse for delivery.
 
     This function:
-    - Ensures a request_id exists (generate one if missing).
+    - Ensures a request_id exists (generate one if missing) and attaches it
+      to metadata when possible.
     - Optionally updates metadata.generation_time_ms from start/end timestamps.
-    - Optionally updates metadata.tokens_used and metadata.cost_estimate_thb.
+    - Optionally updates metadata.tokens_used and metadata.cost_estimate_thb
+      from LLMUsageSummary or explicit primitives.
     - Optionally injects profile_info into metadata.profile_info for renderer.
     - Recomputes sections_generated if needed for consistency.
+    - Marks metadata.stage_d_completed=True (best-effort).
     - Logs a summary event for observability.
 
-    Returns:
-        (cv, request_id) after in-place-like updates to `cv`.
+    NOTE:
+      Stage D MUST NOT modify sections or skills content; Stage C is the
+      last stage allowed to change text or skills.
     """
     # Ensure we have a request_id for logging and headers.
     req_id = request_id or _generate_request_id()
@@ -114,7 +121,17 @@ def finalize_cv_response(
     meta = getattr(cv, "metadata", None)
     if meta is None:
         logger.warning("stage_d_missing_metadata_object")
-    # We’ll still try to set fields via setattr guarded by try/except.
+
+    # Attach request_id to metadata if possible (useful for clients / renderer).
+    if meta is not None:
+        try:
+            # Only set if empty / missing to avoid clobbering upstream value.
+            existing_req_id = getattr(meta, "request_id", None)
+            if not existing_req_id:
+                meta.request_id = req_id
+        except Exception:
+            # Non-fatal
+            pass
 
     # Derive generation_time_ms from timestamps if provided.
     computed_ms = _compute_generation_time_ms(generation_start, generation_end)
@@ -146,12 +163,17 @@ def finalize_cv_response(
     # Update metadata from LLM usage summary if provided.
     if llm_usage is not None and meta is not None:
         try:
+            # Aggregate tokens & cost
             meta.tokens_used = llm_usage.total_tokens
             meta.cost_estimate_thb = llm_usage.total_cost_thb
-            if getattr(meta, "model_version", "unknown") in ("unknown", "", "gemini-2.5-flash"):
+
+            # Optionally refine model_version from usage info
+            current_model = getattr(meta, "model_version", "unknown")
+            if current_model in ("unknown", "", "gemini-2.5-flash"):
                 if llm_usage.model not in ("", "unknown"):
                     meta.model_version = llm_usage.model
         except Exception:
+            # Metadata is best-effort; do not fail Stage D on assignment issues.
             pass
 
     # Or update tokens/cost explicitly if provided as primitives.
@@ -161,6 +183,12 @@ def finalize_cv_response(
                 meta.tokens_used = total_tokens
             if total_cost_thb is not None:
                 meta.cost_estimate_thb = total_cost_thb
+        except Exception:
+            pass
+
+        # Mark Stage D completion flag if the metadata model supports it.
+        try:
+            setattr(meta, "stage_d_completed", True)
         except Exception:
             pass
 
@@ -174,23 +202,41 @@ def finalize_cv_response(
 
     # Log a compact summary for metrics/observability.
     try:
+        # Pull values defensively so logging never breaks the response.
+        status_value = (
+            cv.status.value
+            if isinstance(getattr(cv, "status", None), GenerationStatus)
+            else getattr(cv, "status", None)
+        )
+
+        sections_list = (
+            list((cv.sections or {}).keys())
+            if getattr(cv, "sections", None)
+            else []
+        )
+
+        tokens_used = getattr(meta, "tokens_used", None) if meta is not None else None
+        cost_estimate = getattr(meta, "cost_estimate_thb", None) if meta is not None else None
+        gen_time_ms = getattr(meta, "generation_time_ms", None) if meta is not None else None
+
         logger.info(
             "cv_generation_packaged",
             request_id=req_id,
+            user_id=user_id,
             job_id=getattr(cv, "job_id", None),
             template_id=getattr(cv, "template_id", None),
-            status=(
-                cv.status.value
-                if isinstance(cv.status, GenerationStatus)
-                else cv.status
-            ),
+            status=status_value,
             language=getattr(cv, "language", None),
-            sections=list((cv.sections or {}).keys()) if getattr(cv, "sections", None) else [],
+            sections=sections_list,
             sections_generated=getattr(meta, "sections_generated", None) if meta is not None else None,
-            tokens_used=getattr(meta, "tokens_used", None) if meta is not None else None,
-            cost_estimate_thb=getattr(meta, "cost_estimate_thb", None) if meta is not None else None,
-            generation_time_ms=getattr(meta, "generation_time_ms", None) if meta is not None else None,
-            user_id=user_id,
+            tokens_used=tokens_used,
+            cost_estimate_thb=cost_estimate,
+            generation_time_ms=gen_time_ms,
+            # LLM usage breakdown (if provided)
+            llm_model=llm_usage.model if llm_usage is not None else None,
+            llm_prompt_tokens=llm_usage.prompt_tokens if llm_usage is not None else None,
+            llm_completion_tokens=llm_usage.completion_tokens if llm_usage is not None else None,
+            llm_total_tokens=llm_usage.total_tokens if llm_usage is not None else None,
         )
     except Exception:
         # Logging should never break the response.
@@ -212,7 +258,8 @@ def build_error_response(
     Build a standardized ErrorResponse for failed requests.
 
     This is the Stage D entrypoint for packaging fatal errors coming from any
-    stage (A/B/C) or from the orchestrator itself.
+    stage (A/B/C) or from the orchestrator itself. The caller is responsible
+    for mapping (ErrorResponse, http_status) into HTTP response objects.
     """
     req_id = request_id or _generate_request_id()
     err = ErrorResponse(

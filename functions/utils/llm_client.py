@@ -8,9 +8,9 @@ from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Optional, Callable, cast
-
 import structlog
-import yaml
+
+from functions.utils.common import load_yaml_dict
 
 logger = structlog.get_logger().bind(module="llm_client")
 
@@ -126,36 +126,18 @@ def _safe_get_text(resp, prompt=None):
 def _project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
-
-@lru_cache(maxsize=1)
-def _load_yaml(path: Path) -> Dict[str, Any]:
-    try:
-        if not path.exists():
-            logger.info("yaml_file_missing", path=str(path))
-            return {}
-        with path.open("r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-        if not isinstance(data, dict):
-            logger.warning("yaml_file_not_dict", path=str(path), type=str(type(data)))
-            return {}
-        return data
-    except Exception as e:  # pragma: no cover
-        logger.exception("yaml_file_load_error", path=str(path), error=str(e))
-        return {}
-
-
 @lru_cache(maxsize=1)
 def _load_credentials() -> Dict[str, Any]:
     root = _project_root()
     cred_path = root / "parameters" / "credentials.yaml"
-    return _load_yaml(cred_path)
+    return load_yaml_dict(cred_path)
 
 
 @lru_cache(maxsize=1)
 def _load_parameters() -> Dict[str, Any]:
     root = _project_root()
     params_path = root / "parameters" / "parameters.yaml"
-    return _load_yaml(params_path)
+    return load_yaml_dict(params_path)
 
 
 @lru_cache(maxsize=1)

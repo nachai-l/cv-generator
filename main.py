@@ -37,6 +37,7 @@ from functions.utils.common import (
     model_dump_compat,
     select_llm_client_and_params,
     ensure_llm_metrics_env,
+    load_yaml_dict,
 )
 
 logger = structlog.get_logger().bind(module="main")
@@ -88,8 +89,15 @@ def run_cv_generation(
 
     generation_start = datetime.now(timezone.utc)
 
+    # Load parameters.yaml and pass the validation block into GuardrailsProcessor
+    root = Path(__file__).resolve().parent
+    params_path = root / "parameters" / "parameters.yaml"
+    params = load_yaml_dict(params_path)
+
     # ----------------------------- Stage A ------------------------------
-    guardrails = GuardrailsProcessor()
+    validation_cfg = params.get("validation", {}) or {}
+
+    guardrails = GuardrailsProcessor(validation_config=validation_cfg)
 
     validation = guardrails.validate_and_sanitize(request)
     if not validation.is_valid:
@@ -98,8 +106,6 @@ def run_cv_generation(
             errors=validation.errors,
             warnings=validation.warnings,
         )
-        # Stage D error packaging is meant for the API layer via build_error_response,
-        # so here we raise and let the HTTP handler call that.
         error_msg = "; ".join(validation.errors or ["Stage A validation failed"])
         raise ValueError(error_msg)
 

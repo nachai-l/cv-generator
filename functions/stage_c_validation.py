@@ -150,7 +150,7 @@ def run_stage_c_validation(
     - Enforces section set & order according to template_info
     - Cleans each section's text (whitespace, length, simple artifacts)
     - Performs light prompt-injection backstop using security patterns
-    - Normalizes and deduplicates skills
+    - Normalizes and deduplicates skills (aligned with Stage B canonical logic)
     - Runs global consistency checks:
         * name/email present (optional)
         * min skills / education thresholds
@@ -397,13 +397,14 @@ def _sanitize_sections(
     """
     - Keep only sections that are allowed by template_info (for ordering),
       but NEVER silently drop sections that Stage B already generated.
-    - Enforce deterministic ordering
+    - Enforce deterministic ordering (template-first, then any extra sections)
     - Run light injection backstop using security patterns
     - Clean & truncate text according to template + validation config
+      (aligned with per-section limits already applied in Stage B)
     """
     cleaned: Dict[str, SectionContent] = {}
 
-    # Pre-compute per-section max length
+    # Pre-compute per-section max length (from template_info, as in Stage B)
     per_section_limits: Dict[str, int] = {}
     tmpl_limits = template_info.get("max_chars_per_section") or {}
     if isinstance(tmpl_limits, dict):
@@ -425,7 +426,7 @@ def _sanitize_sections(
     critical_patterns = security_cfg.get("critical_patterns") or []
     suspicious_patterns = security_cfg.get("suspicious_patterns") or []
 
-    # 🔹 NEW: decide which section IDs to process
+    # Decide which section IDs to process:
     # - If allowed_sections is non-empty, use it for ordering but
     #   also append any extra sections present in `sections`.
     # - If allowed_sections is empty, just use the keys from `sections`.
@@ -452,7 +453,7 @@ def _sanitize_sections(
 
         orig_text = text
 
-        # 🔍 Injection backstop BEFORE further cleaning
+        # Injection backstop BEFORE further cleaning
         if text and critical_patterns:
             if _matches_any_pattern(text, critical_patterns):
                 msg = (
@@ -484,7 +485,7 @@ def _sanitize_sections(
             logger.info("stage_c_section_dropped_empty", section_id=section_id)
             continue
 
-        # Length limit
+        # Length limit (aligned with Stage B per-section character limits)
         max_len = per_section_limits.get(section_id, default_max)
         if max_len > 0 and len(text) > max_len:
             truncated_text = text[:max_len].rstrip()
@@ -589,17 +590,21 @@ def _sanitize_skills(
     """
     Normalize and deduplicate skills.
 
-    - Ensures each item has a non-empty .name
-    - Strips whitespace from name
-    - Deduplicates by (name_lower, level_normalized)
-    - Caps list size via cfg["max_skills"]
+    Aligned with Stage B canonical skill behaviour:
+
+    - Do NOT change canonical levels decided in Stage B.
+    - Deduplicate by skill *name* only (case-insensitive).
+    - If the same skill name appears multiple times and an existing
+      entry has no level but a new one does, upgrade the existing entry.
+    - Cap list size via cfg["max_skills"].
     """
     if not skills:
         return None
 
     max_skills = int(cfg.get("max_skills", 50))
     cleaned: List[OutputSkillItem] = []
-    seen: set[Tuple[str, str]] = set()
+    # Align with Stage B canonical reconciliation → dedupe by name only
+    seen_names: set[str] = set()
 
     def _mk_item(name: str, level: Any, source: Any) -> OutputSkillItem:
         if hasattr(OutputSkillItem, "model_construct"):
@@ -634,13 +639,29 @@ def _sanitize_skills(
         if not name_clean:
             continue
 
+        # Normalize level for simple checks / upgrades
         level_norm = "" if level is None else str(level).strip()
-        dedup_key = (name_clean.lower(), level_norm.lower())
+        name_key = name_clean.lower()
 
-        if dedup_key in seen:
+        if name_key in seen_names:
+            # If we already have this skill by name, we *never* add a new entry
+            # (to preserve Stage B's single canonical record per skill).
+            # However, if the existing record has no level and this one does,
+            # we can safely upgrade it.
+            if level_norm:
+                for existing in cleaned:
+                    if existing.name and existing.name.strip().lower() == name_key:
+                        existing_level = getattr(existing, "level", None)
+                        if not existing_level or not str(existing_level).strip():
+                            try:
+                                existing.level = level  # type: ignore[attr-defined]
+                            except Exception:
+                                # non-fatal; just keep the original
+                                pass
+                        break
             continue
 
-        seen.add(dedup_key)
+        seen_names.add(name_key)
 
         if isinstance(item, OutputSkillItem):
             # Reuse existing instance but normalize name
@@ -779,7 +800,7 @@ def _run_global_consistency_checks(
     num_skills = len(skills_list)
 
     if min_skills_required > 0 and num_skills < min_skills_required:
-        # 🔹 NEW: try to recover skills from the original request
+        # Try to recover skills from the original request
         if original_request is not None:
             fallback_skills = _fallback_skills_from_request(original_request)
             if fallback_skills:
@@ -833,6 +854,26 @@ def _run_global_consistency_checks(
         _cross_check_response_vs_request(resp, original_request, strict_mode)
 
 
+def _normalize_language(value: Any) -> Optional[str]:
+    """
+    Normalize language values for comparison.
+
+    Supports:
+    - Plain strings ("en", "EN", "th-TH")
+    - Enums with .value (LanguageEnum.EN)
+    """
+    if value is None:
+        return None
+
+    lang = getattr(value, "value", value)
+    try:
+        norm = str(lang).strip().lower()
+    except Exception:
+        return None
+
+    return norm or None
+
+
 def _cross_check_response_vs_request(
     resp: CVGenerationResponse,
     original_request: Any,
@@ -843,7 +884,7 @@ def _cross_check_response_vs_request(
 
     - template_id consistency
     - job_id consistency (if both sides have it)
-    - language consistency
+    - language consistency (aligned with Stage A/B enum-or-string usage)
     """
     # template_id
     req_template_id = None
@@ -903,22 +944,27 @@ def _cross_check_response_vs_request(
         if strict_mode:
             raise StageCValidationError(msg)
 
-    # language
-    req_lang = getattr(original_request, "language", None)
-    resp_lang = getattr(resp, "language", None)
+    # language (align enum/string with Stage A/B prompt injection)
+    raw_req_lang = getattr(original_request, "language", None)
+    raw_resp_lang = getattr(resp, "language", None)
 
-    if req_lang and not resp_lang:
+    req_lang_norm = _normalize_language(raw_req_lang)
+    resp_lang_norm = _normalize_language(raw_resp_lang)
+
+    if req_lang_norm and not resp_lang_norm:
+        # Fill missing language in response; prefer the original type
         try:
-            setattr(resp, "language", req_lang)
+            setattr(resp, "language", raw_req_lang if raw_req_lang is not None else req_lang_norm)
         except Exception:
+            # non-fatal
             pass
-    elif req_lang and resp_lang and resp_lang != req_lang:
-        msg = f"language mismatch between request ({req_lang}) and response ({resp_lang})."
+    elif req_lang_norm and resp_lang_norm and req_lang_norm != resp_lang_norm:
+        msg = f"language mismatch between request ({req_lang_norm}) and response ({resp_lang_norm})."
         _append_metadata_warning(resp, msg)
         logger.warning(
             "stage_c_language_mismatch",
-            req_language=req_lang,
-            resp_language=resp_lang,
+            req_language=req_lang_norm,
+            resp_language=resp_lang_norm,
         )
         if strict_mode:
             raise StageCValidationError(msg)

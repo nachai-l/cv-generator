@@ -1,6 +1,8 @@
 template_id: "T_EMPLOYER_STD_V3"
 name: "Professional Employer Standard"
 style: "modern"
+language: "en"
+tone: "funny"
 sections_order:
   - profile_summary
   - skills
@@ -12,6 +14,10 @@ sections_order:
 #  - extracurricular
 #  - volunteering
 #  - interests
+  - publications
+  - training
+  - references
+  - additional_info
 color_scheme:
   primary: "#2C3E50"
   secondary: "#3498DB"
