@@ -132,6 +132,65 @@ def get_pricing_for_model(model_name: str) -> dict[str, float]:
 
     return result
 
+def strip_redundant_section_heading(
+    raw_text: str,
+    section_id: str,
+    removal_map: dict[str, str] | None = None,
+) -> str:
+    """
+    Remove a meaningless first line that repeats the section heading.
+    Keeps all bullets except when the whole line is just the heading itself.
+    """
+
+    # Safe default map (no mutable default argument)
+    if removal_map is None:
+        removal_map = {
+            "references": "references",
+            "additional_info": "additional information",
+        }
+
+    if not raw_text:
+        return raw_text
+
+    # Determine if this section has a redundant title to remove
+    title = removal_map.get(section_id)
+    if not title:
+        return raw_text
+
+    lines = raw_text.splitlines()
+    if not lines:
+        return raw_text
+
+    cleaned: list[str] = []
+    first_nonempty_seen = False
+
+    for ln in lines:
+        stripped = ln.strip()
+
+        # Skip leading empty lines before real content
+        if not stripped and not first_nonempty_seen:
+            continue
+
+        if not first_nonempty_seen:
+            first_nonempty_seen = True
+
+            # Normalize for comparison (do NOT modify original text)
+            core = (
+                stripped
+                .lstrip("-•* ")   # strip bullets only for checking
+                .rstrip(":")
+                .strip()
+                .lower()
+            )
+
+            # If this line is just the heading → remove it
+            if core == title.lower():
+                continue
+
+        cleaned.append(ln)  # keep original line
+
+    return "\n".join(cleaned).strip()
+
 
 def get_thb_per_usd_from_params() -> float:
     """

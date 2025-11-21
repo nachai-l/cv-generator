@@ -103,6 +103,7 @@ from functions.utils.common import (
     load_yaml_dict,
     get_pricing_for_model,
     get_thb_per_usd_from_params,
+    strip_redundant_section_heading,
 )
 logger = structlog.get_logger(__name__)
 
@@ -1233,7 +1234,7 @@ class CVGenerationEngine:
             "=== Profile Info (JSON) ===",
             json.dumps(profile_info, ensure_ascii=False, indent=2),
             "",
-            "=== Job Role / Position / Company (JSON) ===",
+            "=== Target Job Role / Position / Company (JSON) ===",
             json.dumps(
                 {
                     "job_role_info": job_role_info,
@@ -2507,6 +2508,19 @@ class CVGenerationEngine:
                         self._build_section_prompt(request, evidence_plan, section_id),
                         section_id,
                     )
+
+                    # 🔹 Strip Markdown bold markers from LLM text only in this path
+                    if raw_text:
+                        # Keep it simple and conservative: only remove "**"
+                        raw_text = raw_text.replace("**", "")
+                        raw_text =  strip_redundant_section_heading(
+                            raw_text, section_id,
+                            removal_map={
+                                "references": "references",
+                                "additional_info": "additional information",
+                            }
+                        )
+
                     truncated = _truncate_text(
                         raw_text or "",
                         char_limits.get(section_id),

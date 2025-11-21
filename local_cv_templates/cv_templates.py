@@ -427,16 +427,17 @@ def _format_section_content(section_name: str, content: str) -> str:
 
     # ---------------- EXPERIENCE ----------------
     if section_name == "experience":
-        # State machine parser over lines:
+        # New canonical format from Stage B / experience_functions:
+        #   "Associate Director, Synthetic Biology Research| Mojia Biotech Pte. Ltd.| 2023–2024"
+        #   - Led enzyme screening ...
+        #   - Secured government research grants ...
+        #
+        # Legacy / fallback format still supported:
         #   **Job Title**
         #   *Company, 2020–2024*
         #   - Bullet 1
         #   - Bullet 2
-        #
-        # Also supports older shape:
-        #   *Company, 2020–2022*
-        #   - Bullet 1
-        #   - Bullet 2
+
         raw_lines = [
             ln.strip()
             for ln in content.replace("\r\n", "\n").split("\n")
@@ -447,7 +448,11 @@ def _format_section_content(section_name: str, content: str) -> str:
 
         def flush_current() -> None:
             nonlocal current
-            if current and (current["title"] or current["company"] or current["bullets"]):
+            if current and (
+                current.get("title")
+                or current.get("company")
+                or current.get("bullets")
+            ):
                 jobs.append(current)
             current = None
 
@@ -455,83 +460,137 @@ def _format_section_content(section_name: str, content: str) -> str:
             if not ln:
                 continue
 
-            # New job title
-            if ln.startswith("**") and ln.endswith("**"):
-                flush_current()
-                current = {
-                    "title": _strip_md(ln),
-                    "company": "",
-                    "bullets": [],
-                }
-                continue
-
-            # Company + dates (italic)
-            if ln.startswith("*") and ln.endswith("*"):
-                text = _strip_md(ln)
+            # -------- Bullet / responsibility line --------
+            if ln.startswith(("-", "•", "*")):
+                bullet = ln.lstrip("-•*").strip()
+                if not bullet:
+                    continue
                 if current is None:
-                    # Company-only block (no explicit title)
-                    current = {
-                        "title": "",
-                        "company": text,
-                        "bullets": [],
-                    }
-                elif not current["company"]:
-                    current["company"] = text
-                else:
-                    current["bullets"].append(text)
-                continue
-
-            # Bullet / responsibility line
-            if ln.startswith(("-", "•")):
-                bullet = ln.lstrip("-•").strip()
-                if current is None:
+                    # Bullet without header → create anonymous job (rare)
                     current = {
                         "title": "",
                         "company": "",
+                        "years": "",
                         "bullets": [],
                     }
                 current["bullets"].append(bullet)
                 continue
 
-            # Fallback: plain text → treat as extra bullet or title-only job
+            # -------- Header line: new canonical pipe format --------
+            if "|" in ln:
+                flush_current()
+                parts = [p.strip() for p in ln.split("|")]
+                title = parts[0] if len(parts) >= 1 else ""
+                company = parts[1] if len(parts) >= 2 else ""
+                years = parts[2] if len(parts) >= 3 else ""
+
+                current = {
+                    "title": title,
+                    "company": company,
+                    "years": years,
+                    "bullets": [],
+                }
+                continue
+
+            # -------- Legacy markdown: **Title** --------
+            if ln.startswith("**") and ln.endswith("**"):
+                flush_current()
+                title = _strip_md(ln)
+                current = {
+                    "title": title,
+                    "company": "",
+                    "years": "",
+                    "bullets": [],
+                }
+                continue
+
+            # -------- Legacy markdown: *Company, 2020–2024* --------
+            if ln.startswith("*") and ln.endswith("*"):
+                text = _strip_md(ln)
+                if current is None:
+                    current = {
+                        "title": "",
+                        "company": text,
+                        "years": "",
+                        "bullets": [],
+                    }
+                else:
+                    # Try to split company + years, very lightly
+                    # e.g. "Mitsui Chemicals, 2017–2023"
+                    m = re.match(r"^(.*?)[,|]\s*(\d{4}–(?:\d{4}|Present))$", text)
+                    if m:
+                        current["company"] = m.group(1).strip()
+                        current["years"] = m.group(2).strip()
+                    elif not current.get("company"):
+                        current["company"] = text
+                    else:
+                        current["bullets"].append(text)
+                continue
+
+            # -------- Fallback: plain text --------
             if current is None:
+                # Treat as a title-only header line
                 current = {
                     "title": ln,
                     "company": "",
+                    "years": "",
                     "bullets": [],
                 }
             else:
+                # Extra description line → treat as bullet
                 current["bullets"].append(ln)
 
         flush_current()
 
+        # ---------- Build HTML ----------
         html_blocks: list[str] = []
         for job in jobs:
             title_html = ""
             meta_html = ""
 
-            if job["title"]:
-                title_html = f'<div class="item-title">{job["title"]}</div>'
-                if job["company"]:
-                    meta_html = f'<div class="item-meta">{job["company"]}</div>'
-            elif job["company"]:
-                # No explicit title → show company+years as title line
-                title_html = f'<div class="item-title">{job["company"]}</div>'
+            title = (job.get("title") or "").strip()
+            company = (job.get("company") or "").strip()
+            years = (job.get("years") or "").strip()
+
+            if title:
+                title_html = f'<div class="item-title">{title}</div>'
+
+            meta_parts = []
+            if company:
+                meta_parts.append(company)
+            if years:
+                meta_parts.append(years)
+
+            if meta_parts:
+                meta_html = f'<div class="item-meta">{" | ".join(meta_parts)}</div>'
+
+            # If no title but we have meta → promote meta to title
+            if not title_html and meta_html:
+                title_html = meta_html
+                meta_html = ""
 
             bullets_html = ""
-            if job["bullets"]:
+            bullets = job.get("bullets") or []
+            if bullets:
                 bullets_html = (
                     '<ul class="item-bullets">'
-                    + "".join(f"<li>{b}</li>" for b in job["bullets"])
+                    + "".join(f"<li>{b}</li>" for b in bullets)
                     + "</ul>"
                 )
+
+            header_html = ""
+
+            if title_html:
+                header_html += f'<div class="item-title">{title}</div>'
+
+            if meta_parts:
+                header_html += f'<div class="item-meta">{" | ".join(meta_parts)}</div>'
 
             html_blocks.append(
                 f"""
                 <div class="experience-item">
                     <div class="item-header">
-                        {title_html}
-                        {meta_html}
+                        {header_html}
                     </div>
                     {bullets_html}
                 </div>
