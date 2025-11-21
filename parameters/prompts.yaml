@@ -200,17 +200,18 @@ extracurricular: |
 # References / Additional info / Interests / Volunteering
 # -------------------------------------------------------------------
 references: |
-  Write a brief references section appropriate for a CV.
+  Write a brief references section appropriate for a CV as a bulleted list per each reference.
   If specific referees are provided in the profile, summarize them in a concise way.
   If not, use a standard line such as:
     "References are available upon request."
   Do not include contact details that are not present in the profile.
+  Do not return "References" or similar in the first line
 
 additional_info: |
-  Write an additional information section summarizing any extra details that
-  are relevant to the candidate's profile (e.g. languages, availability, relocation, hobbies).
-  Use either a short paragraph or a few bullets.
+  Write an additional information section summarizing any extra details using a bullets format.
+  Must be relevant to the candidate's profile (e.g. languages, availability, relocation, hobbies).
   Do not repeat information already clearly covered in other sections unless it improves clarity.
+  Do not return "Additional Information" or similar in the first line
 
 interests: |
   Write a short list of interests or hobbies as bullets or a simple comma-separated line.
