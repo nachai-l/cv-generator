@@ -352,13 +352,23 @@ def render_cv_html(
 
 
 def _strip_md(s: str) -> str:
-    """Very small helper to strip surrounding **bold** or *italic* markers."""
+    """Strip **bold**, *italic*, and extra trailing punctuation like '**,'."""
     s = s.strip()
+
+    # Handle '**something**,' case
+    if s.startswith("**") and s.endswith("**,"):
+        return s[2:-3].strip()
+
+    # Handle '**something**' case
     if s.startswith("**") and s.endswith("**"):
         return s[2:-2].strip()
+
+    # Handle '*something*'
     if s.startswith("*") and s.endswith("*"):
         return s[1:-1].strip()
+
     return s
+
 
 
 def _parse_bullet_lines(content: str) -> list[str]:
@@ -533,32 +543,61 @@ def _format_section_content(section_name: str, content: str) -> str:
 
     # ---------------- EDUCATION ----------------
     if section_name == "education":
-        # Expect lines like "- PhD in ..., NAIST, Japan"
         items_html: list[str] = []
+
         for ln in lines:
             ln = ln.strip()
             if not ln:
                 continue
-            if ln.startswith(("-", "•")):
-                ln = ln.lstrip("-•").strip()
 
-            parts = [p.strip() for p in ln.split(",") if p.strip()]
-            if not parts:
-                continue
+            # Remove bullet markers if any
+            if ln.startswith(("-", "•", "*")):
+                ln = ln.lstrip("-•*").strip()
 
-            degree = parts[0]
-            institution = ", ".join(parts[1:]) if len(parts) > 1 else ""
+            # Extract **degree**
+            degree = ""
+            rest = ln
 
-            items_html.append(
-                f"""
+            if ln.startswith("**"):
+                end = ln.find("**", 2)
+                if end != -1:
+                    degree = _strip_md(ln[:end+2])
+                    rest = ln[end+2:].lstrip(" ,")
+                else:
+                    rest = ln  # fallback
+
+            # Parse rest: Field | Institution | Years | GPA
+            parts = [p.strip() for p in rest.split("|")]
+
+            field        = parts[0] if len(parts) > 0 else ""
+            institution  = parts[1] if len(parts) > 1 else ""
+            year_range   = parts[2] if len(parts) > 2 else ""
+            gpa_raw      = parts[3] if len(parts) > 3 else ""
+
+            gpa = gpa_raw.split(":", 1)[-1].strip() if gpa_raw.lower().startswith("gpa") else gpa_raw
+
+            # Build meta line
+            meta_parts = []
+            if field:       meta_parts.append(field)
+            if institution: meta_parts.append(institution)
+            if year_range:  meta_parts.append(year_range)
+            if gpa:         meta_parts.append(f"GPA: {gpa}")
+
+            meta = " | ".join(meta_parts)
+
+            # Fallback if degree failed
+            if not degree:
+                degree = field or ln
+
+            items_html.append(f"""
                 <div class="education-item">
-                    <div class="degree">{degree}</div>
-                    <div class="institution">{institution}</div>
+                    <div class="degree"><strong>{degree}</strong></div>
+                    <div class="institution">{meta}</div>
                 </div>
-                """
-            )
+            """)
 
         return "".join(items_html)
+
 
     # ---------------- CERTIFICATIONS ----------------
     if section_name == "certifications":
