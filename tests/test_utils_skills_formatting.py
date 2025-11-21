@@ -1,7 +1,7 @@
 """
 Unittest suite for skills formatting utilities.
 
-This module tests the pure helper functions in:
+This module tests_utils the pure helper functions in:
 
     functions.utils.skills_formatting
 
@@ -21,7 +21,7 @@ Core responsibilities covered:
       back into a list of skill phrases, used as a fallback when
       structured JSON is missing.
 
-These tests intentionally do **not** depend on Stage B, LLM clients,
+These tests_utils intentionally do **not** depend on Stage B, LLM clients,
 or parameters.yaml — they ensure the formatting behaviour remains
 stable and predictable across the pipeline.
 """

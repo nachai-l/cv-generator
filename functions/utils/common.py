@@ -12,8 +12,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Dict, Tuple
-
+from typing import Any, Dict, Tuple, Mapping
 import yaml
 import structlog
 
@@ -22,12 +21,12 @@ logger = structlog.get_logger().bind(module="utils.common")
 # Root of project (two dirs up from utils/)
 ROOT = Path(__file__).resolve().parents[2]
 
+# Simple cache for full parameters.yaml
+_PARAMETERS_CACHE: Dict[str, Any] | None = None
+
 # ---------------------------------------------------------------------------
 # yaml reader
 # ---------------------------------------------------------------------------
-
-from pathlib import Path
-from typing import Any, Mapping
 
 def load_yaml_dict(path: str | Path) -> dict[str, Any]:
     """
@@ -54,6 +53,115 @@ def load_yaml_dict(path: str | Path) -> dict[str, Any]:
     except Exception as exc:
         logger.error("yaml_file_load_error", path=path, error=str(exc))
         return {}
+
+# ---------------------------------------------------------------------------
+# Full parameters.yaml loader (cached)
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Full parameters.yaml loader (cached)
+# ---------------------------------------------------------------------------
+
+_PARAMETERS_CACHE: Dict[str, Any] | None = None
+
+def load_all_parameters() -> Dict[str, Any]:
+    """
+    Load and cache the entire parameters/parameters.yaml file.
+    Used by pricing + currency conversion helpers.
+    """
+    global _PARAMETERS_CACHE
+    if _PARAMETERS_CACHE is not None:
+        return _PARAMETERS_CACHE
+
+    params_path = ROOT / "parameters" / "parameters.yaml"
+
+    if not params_path.exists():
+        logger.warning("parameters_yaml_missing", path=str(params_path))
+        _PARAMETERS_CACHE = {}
+        return _PARAMETERS_CACHE
+
+    try:
+        with params_path.open("r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        if not isinstance(cfg, dict):
+            logger.warning(
+                "parameters_root_not_mapping",
+                path=str(params_path),
+                root_type=type(cfg).__name__,
+            )
+            cfg = {}
+    except Exception as exc:
+        logger.error("parameters_yaml_load_error", path=str(params_path), error=str(exc))
+        cfg = {}
+
+    _PARAMETERS_CACHE = cfg
+    return _PARAMETERS_CACHE
+
+# ---------------------------------------------------------------------------
+# Price helpers
+# ---------------------------------------------------------------------------
+def get_pricing_for_model(model_name: str) -> dict[str, float]:
+    """
+    Resolve USD/token pricing from parameters.yaml.
+    Falls back to 'default' pricing if model-specific entry is missing.
+    """
+    params = load_all_parameters()
+    pricing_cfg = params.get("pricing", {}) or {}
+
+    cfg = (
+        pricing_cfg.get(model_name)
+        or pricing_cfg.get("default")
+        or {}
+    )
+
+    result = {}
+
+    try:
+        result["usd_per_input_token"] = float(
+            cfg.get("usd_per_input_token", 0.0) or 0.0
+        )
+    except Exception:
+        result["usd_per_input_token"] = 0.0
+
+    try:
+        result["usd_per_output_token"] = float(
+            cfg.get("usd_per_output_token", 0.0) or 0.0
+        )
+    except Exception:
+        result["usd_per_output_token"] = 0.0
+
+    return result
+
+
+def get_thb_per_usd_from_params() -> float:
+    """
+    Look up THB-per-USD conversion from parameters.yaml.
+    Supported keys:
+        thb_per_usd
+        usd_to_thb
+        thb_rate
+    Returns 1.0 if missing.
+    """
+    params = load_all_parameters() or {}
+    candidates: list[dict] = []
+
+    if isinstance(params, dict):
+        candidates.append(params)
+        if isinstance(params.get("currency"), dict):
+            candidates.append(params["currency"])
+        if isinstance(params.get("pricing"), dict):
+            candidates.append(params["pricing"])
+
+    for container in candidates:
+        for key in ("thb_per_usd", "usd_to_thb", "thb_rate"):
+            val = container.get(key)
+            try:
+                if val is not None:
+                    return float(val)
+            except Exception:
+                continue
+
+    return 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +249,7 @@ def load_yaml_file(path: Path) -> Dict[str, Any]:
 
     - Returns {} if the file is missing or empty.
     - Logs helpful warnings instead of raising in most cases, so it is
-      safe for CLIs / tests.
+      safe for CLIs / tests_utils.
     """
     if not path.exists():
         logger.error("yaml_file_missing", path=str(path))
@@ -245,4 +353,7 @@ __all__ = [
     "load_yaml_file",
     "resolve_token_budget",
     "load_yaml_dict",
+    "get_pricing_for_model",
+    "get_thb_per_usd_from_params",
+    "load_all_parameters",
 ]

@@ -1,6 +1,6 @@
 """Unittest suite for Stage A guardrails (validate_and_sanitize + evidence plan).
 
-These tests use the YAML fixtures that represent the expected input
+These tests_utils use the YAML fixtures that represent the expected input
 format for the Stage A contract:
 
 - profile_info.yaml                  → request.profile_info (required)
@@ -211,7 +211,7 @@ class TestStageAGuardrails(unittest.TestCase):
         print("-" * 90 + "\n", file=sys.stderr)
 
     # ------------------------------------------------------------------
-    # Validation tests
+    # Validation tests_utils
     # ------------------------------------------------------------------
 
     def test_validate_and_sanitize_full_yaml_payload_is_valid(self):
@@ -332,7 +332,7 @@ class TestStageAGuardrails(unittest.TestCase):
         )
 
     # ------------------------------------------------------------------
-    # Evidence plan tests
+    # Evidence plan tests_utils
     # ------------------------------------------------------------------
 
     def test_build_evidence_plan_from_profile_info(self):
@@ -478,7 +478,7 @@ class TestStageAGuardrails(unittest.TestCase):
         self.assertIn(missing_jd_warning, result.warnings or [])
 
     # ------------------------------------------------------------------
-    # New tests for resolve_template_info (legacy + new API shapes)
+    # New tests_utils for resolve_template_info (legacy + new API shapes)
     # ------------------------------------------------------------------
 
     def test_resolve_template_info_legacy_request_uses_template_info_field(self):

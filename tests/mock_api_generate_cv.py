@@ -1,4 +1,4 @@
-# tests/mock_api_generate_cv.py
+# tests_utils/mock_api_generate_cv.py
 from __future__ import annotations
 
 import json
@@ -263,7 +263,7 @@ def _load_yaml(path: Path) -> Dict[str, Any]:
 
 
 def build_mock_api_payload() -> Dict[str, Any]:
-    """Load each YAML file under tests/json_test_inputs and combine them."""
+    """Load each YAML file under tests_utils/json_test_inputs and combine them."""
     json_input_dir = THIS_FILE.parent / "json_test_inputs"
 
     company_info = _load_yaml(json_input_dir / "company_info.yaml")

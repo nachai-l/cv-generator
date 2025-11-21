@@ -59,6 +59,7 @@ from pathlib import Path
 from functools import lru_cache
 
 import structlog
+from dataclasses import dataclass
 from structlog.contextvars import bind_contextvars, clear_contextvars
 from pydantic import BaseModel
 
@@ -97,7 +98,12 @@ from functions.utils.experience_functions import (
     parse_experience_bullets_response,
 )
 from functions.utils.language_tone import describe_language, describe_tone
-from functions.utils.common import resolve_token_budget, load_yaml_dict
+from functions.utils.common import (
+    resolve_token_budget,
+    load_yaml_dict,
+    get_pricing_for_model,
+    get_thb_per_usd_from_params,
+)
 logger = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -147,6 +153,38 @@ except (TypeError, ValueError):
 # ---------------------------------------------------------------------------
 # Helper classes / functions
 # ---------------------------------------------------------------------------
+@dataclass
+class StageBTelemetry:
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_cost_usd: float = 0.0
+    calls: int = 0
+
+    def add_usage_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        """
+        Accepts the usage_snapshot dict from llm_metrics.call_llm_section_with_metrics.
+        Expected keys: input_tokens, output_tokens, total_cost_usd (others ignored).
+        """
+        if not snapshot:
+            return
+
+        try:
+            self.total_input_tokens += int(snapshot.get("input_tokens", 0) or 0)
+            self.total_output_tokens += int(snapshot.get("output_tokens", 0) or 0)
+            self.total_cost_usd += float(snapshot.get("total_cost_usd", 0.0) or 0.0)
+            self.calls += 1
+        except Exception:
+            # best-effort; don't break pipeline if metrics are weird
+            return
+
+    @property
+    def total_tokens(self) -> int:
+        return self.total_input_tokens + self.total_output_tokens
+
+    @property
+    def cost_estimate_thb(self) -> float:
+        rate = get_thb_per_usd_from_params()
+        return float(self.total_cost_usd) * float(rate)
 
 class _CallableToClientAdapter:
     """
@@ -237,7 +275,7 @@ def _extract_training_year(entry):
 
 def _render_experience_header(entry: Any) -> str:
     """
-    Backwards-compatible wrapper for tests and legacy callers.
+    Backwards-compatible wrapper for tests_utils and legacy callers.
 
     The actual implementation lives in functions.utils.experience_functions
     as `render_experience_header`.
@@ -254,52 +292,52 @@ BAD_SECTION_HEADINGS = (
     "การฝึกอบรม",
 )
 
-def _load_prompts_from_file() -> dict[str, str]:
-    """
-    Load prompts from parameters/prompts.yaml if present, and merge with
-    generation.prompts from parameters.yaml (used heavily in tests).
-
-    Precedence:
-    1. prompts.yaml (file) – highest precedence
-    2. generation.prompts from load_parameters() – used as fallback/override in tests
-    """
-    prompts: dict[str, str] = {}
-
-    # 1) Try parameters/prompts.yaml (or whatever PROMPTS_FILE points to)
-    path = Path(__file__).resolve().parent.parent / "parameters" / PROMPTS_FILE
-    try:
-        cfg = load_yaml_dict(path)
-        # supports both:
-        #   prompts:
-        #     default: "..."
-        # or a root-level dict of prompts
-        candidate = cfg.get("prompts", cfg) if isinstance(cfg, dict) else {}
-        if isinstance(candidate, dict):
-            for k, v in candidate.items():
-                prompts[str(k)] = str(v)
-    except Exception as e:
-        logger.error(
-            "yaml_file_load_error",
-            path=str(path),
-            error=str(e),
-        )
-
-    # 2) Merge generation.prompts from parameters.yaml (tests patch load_parameters())
-    try:
-        params = load_parameters() or {}
-        gen_cfg = params.get("generation", {}) or {}
-        param_prompts = gen_cfg.get("prompts") or {}
-        if isinstance(param_prompts, dict):
-            # Do not overwrite explicit file prompts
-            for k, v in param_prompts.items():
-                prompts.setdefault(str(k), str(v))
-    except Exception as e:
-        logger.warning(
-            "prompts_load_parameters_failed",
-            error=str(e),
-        )
-
-    return prompts
+# def _load_prompts_from_file() -> dict[str, str]:
+#     """
+#     Load prompts from parameters/prompts.yaml if present, and merge with
+#     generation.prompts from parameters.yaml (used heavily in tests_utils).
+#
+#     Precedence:
+#     1. prompts.yaml (file) – highest precedence
+#     2. generation.prompts from load_parameters() – used as fallback/override in tests_utils
+#     """
+#     prompts: dict[str, str] = {}
+#
+#     # 1) Try parameters/prompts.yaml (or whatever PROMPTS_FILE points to)
+#     path = Path(__file__).resolve().parent.parent / "parameters" / PROMPTS_FILE
+#     try:
+#         cfg = load_yaml_dict(path)
+#         # supports both:
+#         #   prompts:
+#         #     default: "..."
+#         # or a root-level dict of prompts
+#         candidate = cfg.get("prompts", cfg) if isinstance(cfg, dict) else {}
+#         if isinstance(candidate, dict):
+#             for k, v in candidate.items():
+#                 prompts[str(k)] = str(v)
+#     except Exception as e:
+#         logger.error(
+#             "yaml_file_load_error",
+#             path=str(path),
+#             error=str(e),
+#         )
+#
+#     # 2) Merge generation.prompts from parameters.yaml (tests_utils patch load_parameters())
+#     try:
+#         params = load_parameters() or {}
+#         gen_cfg = params.get("generation", {}) or {}
+#         param_prompts = gen_cfg.get("prompts") or {}
+#         if isinstance(param_prompts, dict):
+#             # Do not overwrite explicit file prompts
+#             for k, v in param_prompts.items():
+#                 prompts.setdefault(str(k), str(v))
+#     except Exception as e:
+#         logger.warning(
+#             "prompts_load_parameters_failed",
+#             error=str(e),
+#         )
+#
+#     return prompts
 
 
 def _get_available_sections(request: CVGenerationRequest) -> set[str]:
@@ -1338,8 +1376,6 @@ class CVGenerationEngine:
 
         return "\n".join(lines)
 
-
-
     # ------------------------------------------------------------------
     # LLM call with retries (Option C: feature flag for zero-token retry)
     # ------------------------------------------------------------------
@@ -1352,7 +1388,7 @@ class CVGenerationEngine:
         """
         Compatibility wrapper around the pure resolve_token_budget().
 
-        Uses load_parameters() so that tests can monkeypatch it.
+        Uses load_parameters() so that tests_utils can monkeypatch it.
         Falls back to module-level PARAMS if load_parameters() fails.
         """
         try:
@@ -1365,6 +1401,73 @@ class CVGenerationEngine:
                 return None
 
         return resolve_token_budget(section_id, attempt, all_params)
+
+    def _aggregate_usage_and_cost(self) -> tuple[int, float, float, dict[str, Any]]:
+        """
+        Aggregate total tokens and estimated cost in THB for this request.
+
+        Uses:
+        - self._llm_usage_records collected during _call_llm_with_retries
+        - pricing config from parameters.yaml (via get_pricing_for_model)
+        - THB conversion rate from parameters.yaml (via get_thb_per_usd_from_params)
+        """
+        if not self._llm_usage_records:
+            return 0, 0.0, 0.0, {
+                "total_input_tokens": 0,
+                "total_output_tokens": 0,
+                "usage_by_section": {},
+            }
+
+        model_name = self.generation_params.get("model", "gemini-2.5-flash")
+        pricing = get_pricing_for_model(model_name)
+        usd_per_input = pricing.get("usd_per_input_token", 0.0)
+        usd_per_output = pricing.get("usd_per_output_token", 0.0)
+
+        total_input_tokens = 0
+        total_output_tokens = 0
+        usage_by_section: dict[str, dict[str, Any]] = {}
+
+        for rec in self._llm_usage_records:
+            section_id = str(rec.get("section_id", "unknown"))
+
+            inp = int(
+                rec.get("input_tokens")
+                or rec.get("prompt_tokens")
+                or 0
+            )
+            out = int(
+                rec.get("output_tokens")
+                or rec.get("completion_tokens")
+                or 0
+            )
+
+            total_input_tokens += inp
+            total_output_tokens += out
+
+            sec = usage_by_section.setdefault(
+                section_id,
+                {"input_tokens": 0, "output_tokens": 0, "calls": 0},
+            )
+            sec["input_tokens"] += inp
+            sec["output_tokens"] += out
+            sec["calls"] += 1
+
+        total_tokens = total_input_tokens + total_output_tokens
+        total_cost_usd = (
+                total_input_tokens * usd_per_input
+                + total_output_tokens * usd_per_output
+        )
+
+        thb_per_usd = get_thb_per_usd_from_params()
+        total_cost_thb = total_cost_usd * thb_per_usd
+
+        extra = {
+            "total_input_tokens": total_input_tokens,
+            "total_output_tokens": total_output_tokens,
+            "thb_per_usd": thb_per_usd,
+            "usage_by_section": usage_by_section,
+        }
+        return total_tokens, total_cost_thb, total_cost_usd, extra
 
     # ------------------------------------------------------------------
     # LLM call with retries (Option C: feature flag for zero-token retry)
@@ -1452,6 +1555,18 @@ class CVGenerationEngine:
                 metrics_client = self._metrics_client
 
             try:
+                # ---- define usage callback so we can aggregate tokens/cost ----
+                def _record_usage(snapshot: Dict[str, Any] | None) -> None:
+                    if not snapshot:
+                        return
+                    try:
+                        record = dict(snapshot)
+                    except Exception:
+                        record = {"_raw": str(snapshot)}
+                    # keep section info for later breakdown
+                    record.setdefault("section_id", section_id)
+                    self._llm_usage_records.append(record)
+
                 resp = call_llm_section_with_metrics(
                     llm_client=metrics_client,
                     model=params.get("model"),
@@ -1460,6 +1575,7 @@ class CVGenerationEngine:
                     purpose="stage_b_generation",
                     user_id=getattr(self, "_current_user_id", "unknown"),
                     messages=None,
+                    usage_callback=_record_usage,
                 )
 
                 raw_text = str(resp).strip()
@@ -1489,13 +1605,27 @@ class CVGenerationEngine:
                         self._last_retry_count = attempt - 1
                         return ""
 
-                # ----------------------------------------------------------
-                # 3) Inspect usage snapshot to detect real vs mock LLM
-                # ----------------------------------------------------------
-                usage = getattr(resp, "_llm_usage_snapshot", None)
-                total_tokens = 0
-                if isinstance(usage, dict):
-                    total_tokens = int(usage.get("total_tokens", 0) or 0)
+                # # ----------------------------------------------------------
+                # # 3) Inspect usage snapshot to detect real vs mock LLM
+                # # ----------------------------------------------------------
+                # usage = getattr(resp, "_llm_usage_snapshot", None)
+                # total_tokens = 0
+                # if isinstance(usage, dict):
+                #     total_tokens = int(usage.get("total_tokens", 0) or 0)
+                #
+                #     # 🔹 Track usage for aggregation (tokens + per-section stats)
+                #     try:
+                #         record = dict(usage)
+                #     except Exception:  # ultra defensive
+                #         record = {"_raw": str(usage)}
+                #     record.setdefault("section_id", section_id)
+                #     self._llm_usage_records.append(record)
+                usage = self._llm_usage_records[-1] if self._llm_usage_records else None
+                total_tokens = int(usage.get("total_tokens", 0) or 0) if usage else 0
+                is_mock_llm = bool(
+                    usage
+                    and usage.get("_source") in (None, "merged")
+                )
 
                 is_mock_llm = (
                         usage is None
@@ -1697,12 +1827,11 @@ class CVGenerationEngine:
 
         # 🔸 delegate parsing + dedup to utils
         return merge_llm_experience_augmentation(items, raw_json)
-
     def _generate_experience_bullets_for_item(
-            self,
-            request: CVGenerationRequest,
-            item: ExperienceItem,
-            max_bullets: int = 6,
+        self,
+        request: CVGenerationRequest,
+        item: ExperienceItem,
+        max_bullets: int = 6,
     ) -> list[str]:
 
         # Heuristic: treat existing bullets as a fallback (not a shortcut)
@@ -1725,9 +1854,9 @@ class CVGenerationEngine:
         language_name = describe_language(raw_language)
 
         tone = (
-                getattr(request, "tone", None)
-                or getattr(request, "style_tone", None)
-                or getattr(getattr(request, "template_info", None), "tone", None)
+            getattr(request, "tone", None)
+            or getattr(request, "style_tone", None)
+            or getattr(getattr(request, "template_info", None), "tone", None)
         )
         tone_desc = describe_tone(tone)
 
@@ -1777,36 +1906,45 @@ class CVGenerationEngine:
 
         prompt = "\n".join(lines)
 
-        raw_text = self._call_llm_with_retries(
-            prompt,
-            section_id="experience_bullets",
-        )
+        try:
+            raw_text = self._call_llm_with_retries(
+                prompt,
+                section_id="experience_bullets",
+            )
 
-        # Try parser first
-        bullets = parse_experience_bullets_response(
-            raw_text,
-            existing_responsibilities=existing,
-            max_bullets=max_bullets,
-        )
+            # Try parser first
+            bullets = parse_experience_bullets_response(
+                raw_text,
+                existing_responsibilities=existing,
+                max_bullets=max_bullets,
+            )
 
-        # 🔹 If parser failed but LLM clearly returned bullet lines, extract them manually
-        if not bullets and raw_text:
-            candidate_lines = []
-            for ln in raw_text.splitlines():
-                stripped = ln.strip()
-                if not stripped:
-                    continue
-                if stripped.startswith(("-", "•", "*")):
-                    # Normalize to "- "
-                    candidate_lines.append(
-                        "- " + stripped.lstrip("-•* ").strip()
-                    )
+            # 🔹 If parser failed but LLM clearly returned bullet lines, extract them manually
+            if not bullets and raw_text:
+                candidate_lines: list[str] = []
+                for ln in raw_text.splitlines():
+                    stripped = ln.strip()
+                    if not stripped:
+                        continue
+                    if stripped.startswith(("-", "•", "*")):
+                        # Normalize to "- "
+                        candidate_lines.append(
+                            "- " + stripped.lstrip("-•* ").strip()
+                        )
 
-            if candidate_lines:
-                bullets = candidate_lines[:max_bullets]
+                if candidate_lines:
+                    bullets = candidate_lines[:max_bullets]
 
-        if bullets:
-            return bullets
+            if bullets:
+                return bullets
+
+        except Exception as exc:
+            logger.warning(
+                "experience_bullets_llm_failed",
+                error=str(exc),
+                title=item.title,
+                company=item.company,
+            )
 
         # Fallback to existing bullets if they were "good"
         if prefer_existing:
@@ -2062,7 +2200,11 @@ class CVGenerationEngine:
             retry_count: int = 0,
             cache_hit: bool = False,
             tokens_used: int = 0,
+            input_tokens: int = 0,
+            output_tokens: int = 0,
+            section_breakdown: list[dict[str, Any]] | None = None,
             cost_estimate_thb: float = 0.0,
+            cost_estimate_usd: float = 0.0,
             skills_output: list[OutputSkillItem] | None = None,
     ) -> CVGenerationResponse:
         """Normalize generated sections and build CVGenerationResponse."""
@@ -2093,7 +2235,11 @@ class CVGenerationEngine:
             sections_requested=len(getattr(request, "sections", []) or []),
             sections_generated=len(sections_dict),
             tokens_used=tokens_used,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            section_breakdown=section_breakdown or [],
             cost_estimate_thb=cost_estimate_thb,
+            cost_estimate_usd=cost_estimate_usd,
             profile_info=profile_info,
         )
 
@@ -2175,6 +2321,8 @@ class CVGenerationEngine:
             sections = getattr(request, "sections", []) or []
             self._current_user_id = getattr(request, "user_id", "unknown")
             self._last_retry_count = 0
+            self._llm_usage_records = []  # reset per-request
+            self.telemetry = StageBTelemetry()
 
             char_limits = _get_section_char_limits(request)
             available_sections = _get_available_sections(request)
@@ -2460,8 +2608,33 @@ class CVGenerationEngine:
                     skills=[(s.name, s.level, s.source) for s in skills_output],
                 )
 
+            # 🔹 Aggregate LLM usage and cost (USD → THB) from collected records
+            total_tokens_used, total_cost_thb, total_cost_usd, usage_extra = self._aggregate_usage_and_cost()
+            usage_by_section = usage_extra.get("usage_by_section", {}) or {}
+            section_breakdown = [
+                {
+                    "section_name": section_id,
+                    "section_input_tokens": int(stats.get("input_tokens", 0) or 0),
+                    "section_output_tokens": int(stats.get("output_tokens", 0) or 0),
+                }
+                for section_id, stats in usage_by_section.items()
+            ]
+
             # 🔹 Telemetry snapshot for skills + overall Stage B
             skills_metrics = _summarize_skills_telemetry(skills_output)
+
+            # NEW: expose usage for Stage D
+            self._model_name = (
+                    getattr(self, "_model_name", None)
+                    or self.generation_params.get("model")
+                    or "gemini-2.5-flash"
+            )
+            self._stage_b_total_input_tokens = int(usage_extra.get("total_input_tokens", 0))
+            self._stage_b_total_output_tokens = int(usage_extra.get("total_output_tokens", 0))
+            self._stage_b_total_tokens = int(total_tokens_used)
+            self._stage_b_total_cost_usd = float(round(total_cost_usd, 4))
+            self._stage_b_total_cost_thb = float(round(total_cost_thb, 4))
+            self._stage_b_section_breakdown = section_breakdown
 
             logger.info(
                 "stage_b_telemetry_summary",
@@ -2469,8 +2642,13 @@ class CVGenerationEngine:
                 retry_count=self._last_retry_count,
                 sections_generated=len(generated_sections),
                 cache_hit=False,
-                tokens_used=0,
-                cost_estimate_thb=0.0,
+                tokens_used=total_tokens_used,
+                cost_estimate_usd=round(total_cost_usd, 4),
+                cost_estimate_thb=round(total_cost_thb, 4),
+                total_input_tokens=usage_extra.get("total_input_tokens", 0),
+                total_output_tokens=usage_extra.get("total_output_tokens", 0),
+                section_breakdown=section_breakdown,
+                # usage_by_section=usage_extra.get("usage_by_section", {}),
                 **skills_metrics,
             )
 
@@ -2480,10 +2658,15 @@ class CVGenerationEngine:
                 generation_time_ms=elapsed_ms,
                 retry_count=self._last_retry_count,
                 cache_hit=False,
-                tokens_used=0,
-                cost_estimate_thb=0.0,
+                tokens_used=total_tokens_used,
+                input_tokens=usage_extra.get("total_input_tokens", 0),
+                output_tokens=usage_extra.get("total_output_tokens", 0),
+                section_breakdown=section_breakdown,
+                cost_estimate_thb=round(total_cost_thb, 4),
+                cost_estimate_usd=round(total_cost_usd, 4),
                 skills_output=skills_output,
             )
+
 
         finally:
             clear_contextvars()

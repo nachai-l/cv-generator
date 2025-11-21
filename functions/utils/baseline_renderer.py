@@ -350,7 +350,7 @@ def _build_metadata(profile_info: Dict[str, Any], template_info: Dict[str, Any])
     Build a minimal metadata object for the baseline response.
 
     This uses a lightweight dynamic object instead of the full metadata schema,
-    because the baseline is primarily used for tests and visual comparison.
+    because the baseline is primarily used for tests_utils and visual comparison.
     """
     meta_cls = type("Meta", (), {})
     meta = meta_cls()

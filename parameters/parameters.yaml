@@ -422,3 +422,5 @@ pricing:
   gpt-4o-mini:
     usd_per_input_token: 0.00000015
     usd_per_output_token: 0.00000060
+
+  thb_per_usd: 32.46 # as of 2025-11-21

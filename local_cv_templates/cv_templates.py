@@ -6,7 +6,7 @@ will contain the template info (see `schemas.cv_template_schema.TemplateSchema`)
 
 This module is handy for:
 - local development
-- unit/integration tests
+- unit/integration tests_utils
 - manual HTML/Markdown preview of generated CVs
 """
 
@@ -84,7 +84,7 @@ def _load_templates_from_yaml() -> dict[str, TemplateConfig]:
 # Local dev registry
 TEMPLATES: dict[str, TemplateConfig] = _load_templates_from_yaml()
 
-# Convenience constants for tests/dev
+# Convenience constants for tests_utils/dev
 EMPLOYER_STANDARD_V3: TemplateConfig = TEMPLATES["T_EMPLOYER_STD_V3"]
 MINIMALIST_V1: TemplateConfig = TEMPLATES["T_MINIMALIST_V1"]
 CREATIVE_V1: TemplateConfig = TEMPLATES["T_CREATIVE_V1"]

@@ -6,7 +6,7 @@ import time
 import uuid
 import os
 import re
-import datetime  # module-level so tests can patch llm_metrics.datetime
+import datetime  # module-level so tests_utils can patch llm_metrics.datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -1277,6 +1277,7 @@ def call_llm_section_with_metrics(
         purpose: str,
         user_id: str,
         messages: Optional[List[Dict[str, Any]]] = None,
+        usage_callback: Optional[callable] = None,
 ) -> str:
     """
     llm_client must have: generate(model=..., messages=[...]) -> resp with .text and optional .usage
@@ -1555,5 +1556,27 @@ def call_llm_section_with_metrics(
             "call_id": call_id,
         },
     )
+    # --- allow caller to accumulate usage/cost (Stage B telemetry) ---
+    if callable(usage_callback):
+        try:
+            # Ensure a non-empty payload even if usage_snapshot failed
+            payload = usage_snapshot or {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": total_tokens,
+                "input_cost_usd": input_cost_usd,
+                "output_cost_usd": output_cost_usd,
+                "total_cost_usd": total_cost_usd,
+                "_source": "llm_metrics_fallback",
+            }
+            usage_callback(payload)
+        except Exception as e:
+            logger.warning(
+                "llm_usage_callback_failed",
+                error=str(e),
+                section_id=section_id,
+                model=model_used,
+                call_id=call_id,
+            )
 
     return text or ""

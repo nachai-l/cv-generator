@@ -158,7 +158,7 @@ def run_stage_c_validation(
     - Optionally enforces strict_mode via StageCValidationError
 
     Returns a CVGenerationResponse that should still dump to the same
-    JSON format as Stage B output (e.g. tests/generated_test_cvs/output_w_llm.json).
+    JSON format as Stage B output (e.g. tests_utils/generated_test_cvs/output_w_llm.json).
     """
     cfg = _load_validation_params()
     strict_mode = bool(cfg.get("strict_mode", False))

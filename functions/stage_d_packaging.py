@@ -52,7 +52,8 @@ class LLMUsageSummary:
     completion_tokens: int = 0
     total_tokens: int = 0
     total_cost_thb: float = 0.0
-
+    total_cost_usd: float = 0.0
+    section_breakdown: Optional[list[dict[str, Any]]] = None
 
 # ---------------------------------------------------------------------------
 # Core packaging helpers
@@ -93,6 +94,7 @@ def finalize_cv_response(
     llm_usage: Optional[LLMUsageSummary] = None,
     total_tokens: Optional[int] = None,
     total_cost_thb: Optional[float] = None,
+    total_cost_usd: Optional[float] = None,
     generation_start: Optional[datetime] = None,
     generation_end: Optional[datetime] = None,
 ) -> Tuple[CVGenerationResponse, str]:
@@ -166,14 +168,42 @@ def finalize_cv_response(
             # Aggregate tokens & cost
             meta.tokens_used = llm_usage.total_tokens
             meta.cost_estimate_thb = llm_usage.total_cost_thb
+            meta.cost_estimate_usd = llm_usage.total_cost_usd
+
+            # These represent total prompt/completion tokens across the pipeline.
+            try:
+                meta.input_tokens = llm_usage.prompt_tokens
+            except Exception:
+                pass
+
+            try:
+                meta.output_tokens = llm_usage.completion_tokens
+            except Exception:
+                pass
+
+            # Ppass section breakdown from Stage B → Stage D → Metadata
+            try:
+                if getattr(llm_usage, "section_breakdown", None):
+                    meta.section_breakdown = llm_usage.section_breakdown
+            except Exception:
+                pass
 
             # Optionally refine model_version from usage info
             current_model = getattr(meta, "model_version", "unknown")
             if current_model in ("unknown", "", "gemini-2.5-flash"):
                 if llm_usage.model not in ("", "unknown"):
                     meta.model_version = llm_usage.model
+
+            # ---- NEW OPTIONAL POLISH ----
+            # Fill in detailed usage breakdown
+            setattr(meta, "llm_model", llm_usage.model)
+            setattr(meta, "llm_prompt_tokens", llm_usage.prompt_tokens)
+            setattr(meta, "llm_completion_tokens", llm_usage.completion_tokens)
+            setattr(meta, "llm_total_tokens", llm_usage.total_tokens)
+            # --------------------------------
+
         except Exception:
-            # Metadata is best-effort; do not fail Stage D on assignment issues.
+            # Metadata best-effort; never break Stage D
             pass
 
     # Or update tokens/cost explicitly if provided as primitives.
@@ -183,6 +213,8 @@ def finalize_cv_response(
                 meta.tokens_used = total_tokens
             if total_cost_thb is not None:
                 meta.cost_estimate_thb = total_cost_thb
+            if total_cost_usd is not None:
+                meta.cost_estimate_usd = total_cost_usd
         except Exception:
             pass
 
@@ -216,8 +248,14 @@ def finalize_cv_response(
         )
 
         tokens_used = getattr(meta, "tokens_used", None) if meta is not None else None
-        cost_estimate = getattr(meta, "cost_estimate_thb", None) if meta is not None else None
+        cost_estimate_thb = getattr(meta, "cost_estimate_thb", None) if meta is not None else None
+        cost_estimate_usd = getattr(meta, "cost_estimate_usd", None) if meta is not None else None
         gen_time_ms = getattr(meta, "generation_time_ms", None) if meta is not None else None
+
+        # Pull fine-grained tokens for logging
+        input_tokens = getattr(meta, "input_tokens", None) if meta is not None else None
+        output_tokens = getattr(meta, "output_tokens", None) if meta is not None else None
+
 
         logger.info(
             "cv_generation_packaged",
@@ -230,7 +268,10 @@ def finalize_cv_response(
             sections=sections_list,
             sections_generated=getattr(meta, "sections_generated", None) if meta is not None else None,
             tokens_used=tokens_used,
-            cost_estimate_thb=cost_estimate,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_estimate_thb=cost_estimate_thb,
+            cost_estimate_usd=cost_estimate_usd,
             generation_time_ms=gen_time_ms,
             # LLM usage breakdown (if provided)
             llm_model=llm_usage.model if llm_usage is not None else None,
