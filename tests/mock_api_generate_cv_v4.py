@@ -288,11 +288,11 @@ def main() -> None:
     print(f"Target SERVICE_URL: {SERVICE_URL}")
 
     # 1. Clear output directory
-    print("[1/4] Clearing tests/generated_test_cvs/ ...")
+    print("[1/4] Clearing tests_utils/generated_test_cvs/ ...")
     clear_output_dir()
 
     # 2. Load JSON testcases
-    print("[2/4] Loading testcases from tests/api_payload_tests/ ...")
+    print("[2/4] Loading testcases from tests_utils/api_payload_tests/ ...")
     testcases = load_testcases()
     print(f"     → Found {len(testcases)} testcases")
 

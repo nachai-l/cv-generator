@@ -1,7 +1,7 @@
-# tests/test_stage_d_packaging.py
+# tests_utils/test_stage_d_packaging.py
 
 """
-Unit tests for Stage D – Response Packaging & Delivery.
+Unit tests_utils for Stage D – Response Packaging & Delivery.
 
 Covers:
 - finalize_cv_response(): enrichment of metadata, request_id generation,
@@ -48,7 +48,7 @@ def _build_minimal_cv_response(
 ) -> CVGenerationResponse:
     """
     Helper to construct a minimal-but-valid CVGenerationResponse
-    for Stage D tests.
+    for Stage D tests_utils.
     """
     if sections is None:
         sections = {
@@ -273,7 +273,7 @@ class TestStageDPackaging(unittest.TestCase):
         self.assertEqual(err.message, "Invalid input payload.")
 
     # ------------------------------------------------------------------
-    # New tests for updated Stage D behavior
+    # New tests_utils for updated Stage D behavior
     # ------------------------------------------------------------------
 
     def test_finalize_cv_response_preserves_existing_metadata_request_id(self) -> None:

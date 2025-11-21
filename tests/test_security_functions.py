@@ -10,7 +10,7 @@ Each test prints a concise one-line summary indicating key outcomes:
    [CHECK] test_name → risk=1.0 safe=False patterns=['CRITICAL: ...']
 
 Run with verbosity for best readability:
-    python -m unittest -v tests/test_security_functions.py
+    python -m unittest -v tests_utils/test_security_functions.py
 """
 
 import sys
@@ -33,7 +33,7 @@ from functions.utils.security_functions import (
 # ---------------------------------------------------------------------------
 
 class PrettyTestCase(unittest.TestCase):
-    """Base test case adding consistent headers and dividers between tests."""
+    """Base test case adding consistent headers and dividers between tests_utils."""
 
     def setUp(self):
         test_name = self._testMethodName
@@ -46,15 +46,15 @@ class PrettyTestCase(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Core and extended tests
+# Core and extended tests_utils
 # ---------------------------------------------------------------------------
 
 class TestSecurityFunctions(PrettyTestCase):
-    """Original core tests for security_functions."""
+    """Original core tests_utils for security_functions."""
 
     @classmethod
     def setUpClass(cls) -> None:
-        print("\n=== Core security_functions tests ===")
+        print("\n=== Core security_functions tests_utils ===")
 
     def test_clean_text_is_safe(self):
         """Normal text should be safe with zero risk."""
@@ -108,9 +108,9 @@ class TestInjectionDetectionExtended(PrettyTestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        print("\n=== Extended injection detection tests ===")
+        print("\n=== Extended injection detection tests_utils ===")
 
-    # (All tests remain unchanged)
+    # (All tests_utils remain unchanged)
     # Just inherit from PrettyTestCase — so they’ll print the header/divider automatically
     # ...
 
@@ -120,9 +120,9 @@ class TestSanitizeDict(PrettyTestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        print("\n=== sanitize_dict tests ===")
+        print("\n=== sanitize_dict tests_utils ===")
 
-    # (All tests remain unchanged)
+    # (All tests_utils remain unchanged)
     # They automatically get the pretty test headers/dividers
     # ...
 

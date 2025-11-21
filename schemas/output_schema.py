@@ -124,7 +124,6 @@ class Justification(BaseModel):
 
     model_config = {"extra": "forbid"}
 
-
 class Metadata(BaseModel):
     """Generation metadata and performance metrics."""
 
@@ -133,41 +132,83 @@ class Metadata(BaseModel):
         description="Timestamp of generation",
     )
     model_version: str = Field(
-        default="gemini-2.5-flash", description="LLM model version used"
+        default="gemini-2.5-flash",
+        description="LLM model version used",
     )
     generation_time_ms: int = Field(
-        ..., ge=0, description="Total generation time in milliseconds"
+        ...,
+        ge=0,
+        description="Total generation time in milliseconds",
     )
     retry_count: int = Field(
-        default=0, ge=0, le=10, description="Number of retry attempts"
+        default=0,
+        ge=0,
+        le=10,
+        description="Number of retry attempts",
     )
-    cache_hit: bool = Field(default=False, description="Whether result was cached")
+    cache_hit: bool = Field(
+        default=False,
+        description="Whether result was cached",
+    )
     sections_requested: int = Field(
-        default=0, ge=0, description="Number of sections requested"
+        default=0,
+        ge=0,
+        description="Number of sections requested",
     )
     sections_generated: int = Field(
-        default=0, ge=0, description="Number of sections successfully generated"
+        default=0,
+        ge=0,
+        description="Number of sections successfully generated",
     )
     tokens_used: int = Field(
-        default=0, ge=0, description="Total tokens consumed (if available)"
-    )
-    cost_estimate_thb: float = Field(
-        default=0.0, ge=0.0, description="Estimated cost in THB"
+        default=0,
+        ge=0,
+        description="Total tokens consumed (if available)",
     )
 
-    # 🔹 Carries raw profile info so the renderer can build the header
+    # 🔹 NEW — fine-grained token accounting
+    input_tokens: int | None = Field(
+        default=None,
+        ge=0,
+        description="Total input tokens sent to the LLM",
+    )
+    output_tokens: int | None = Field(
+        default=None,
+        ge=0,
+        description="Total output tokens produced by the LLM",
+    )
+    section_breakdown: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "Per-section token breakdown: "
+            "[{'section_name': str, 'section_input_tokens': int, 'section_output_tokens': int}, ...]"
+        ),
+    )
+
+    cost_estimate_thb: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Estimated cost in THB",
+    )
+    cost_estimate_usd: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Estimated cost in USD",
+    )
+
+    # 🔹 For renderer header construction
     profile_info: dict[str, Any] | None = Field(
         default=None,
         description="Original profile_info payload used for header/contact rendering",
     )
 
-    # 🔹 Correlation id for this generation (aligned with Stage D request_id)
+    # 🔹 Correlation ID, aligned with Stage D
     request_id: str | None = Field(
         default=None,
         description="Request correlation ID (mirrors Stage D request_id when available).",
     )
 
-    # 🔹 Pipeline flags – set by Stage C and Stage D respectively
+    # 🔹 Pipeline flags
     stage_c_validated: bool = Field(
         default=False,
         description="True once Stage C validation has run successfully.",
@@ -181,7 +222,7 @@ class Metadata(BaseModel):
     @classmethod
     def validate_reasonable_time(cls, v: int) -> int:
         """Ensure generation time is reasonable."""
-        if v > 180000:  # 60 seconds
+        if v > 180000:  # 180 seconds
             raise ValueError("Generation time exceeds maximum allowed (180s)")
         return v
 

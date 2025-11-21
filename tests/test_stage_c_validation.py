@@ -1,9 +1,9 @@
-# tests/test_stage_c_validation.py
+# tests_utils/test_stage_c_validation.py
 
 """
 Unittest suite for Stage C validation.
 
-This module tests the core responsibilities of Stage C:
+This module tests_utils the core responsibilities of Stage C:
 
 - Internal helpers:
     - _compute_allowed_sections
@@ -39,7 +39,7 @@ from functions.stage_c_validation import run_stage_c_validation, StageCValidatio
 
 class DummyNewRequestForStageC:
     """
-    Minimal 'new-shape' request-like object for Stage C tests.
+    Minimal 'new-shape' request-like object for Stage C tests_utils.
 
     It has:
     - template_id
@@ -64,7 +64,7 @@ class DummyNewRequestForStageC:
 
 
 class DummyMeta:
-    """Minimal metadata-like object used in Stage C tests."""
+    """Minimal metadata-like object used in Stage C tests_utils."""
 
     def __init__(self) -> None:
         self.validation_warnings: List[str] = []
@@ -73,14 +73,14 @@ class DummyMeta:
 
 
 class DummyTemplateInfoForReq:
-    """Minimal template_info-like object for cross-check tests."""
+    """Minimal template_info-like object for cross-check tests_utils."""
 
     def __init__(self, template_id: str) -> None:
         self.template_id = template_id
 
 
 class DummyRequestForStageC:
-    """Minimal request-like object for cross-check tests."""
+    """Minimal request-like object for cross-check tests_utils."""
 
     def __init__(
         self,

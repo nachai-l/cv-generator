@@ -8,7 +8,7 @@ from typing import Any, Dict
 from types import SimpleNamespace
 
 from functions.utils.baseline_renderer import build_baseline_response
-from tests.utils_test_support import (  # type: ignore  # noqa: E402
+from tests.tests_utils.utils_test_support import (  # type: ignore  # noqa: E402
     load_legacy_yaml_payload,
     compute_sections_from_legacy_template,
 )
@@ -51,10 +51,10 @@ from functions.utils.common import (  # type: ignore  # noqa: E402
 
 def build_mock_api_payload() -> Dict[str, Any]:
     """
-    Load the legacy YAML fixtures from tests/json_test_inputs/ and
+    Load the legacy YAML fixtures from tests_utils/json_test_inputs/ and
     combine them into a single dict.
 
-    Wrapper around tests.test_utils.load_legacy_yaml_payload(), kept here
+    Wrapper around tests_utils.test_utils.load_legacy_yaml_payload(), kept here
     so existing callers don't need to change.
     """
     return load_legacy_yaml_payload()

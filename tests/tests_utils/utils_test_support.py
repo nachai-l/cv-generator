@@ -1,11 +1,11 @@
-# tests/utils_test_support.py
+# tests_utils/utils_test_support.py
 """
-Shared helpers for tests and mock CV generation scripts.
+Shared helpers for tests_utils and mock CV generation scripts.
 
 This module is intentionally test-only and is NOT part of the public
 service API. It provides:
 
-- Loading the legacy YAML fixtures under tests/json_test_inputs/
+- Loading the legacy YAML fixtures under tests_utils/json_test_inputs/
 - Computing a section order from legacy template_info.yaml
 """
 
@@ -32,12 +32,12 @@ JSON_INPUT_DIR = THIS_FILE.parent / "json_test_inputs"
 
 def load_legacy_yaml_payload() -> Dict[str, Any]:
     """
-    Load the legacy YAML inputs from tests/json_test_inputs/ and
+    Load the legacy YAML inputs from tests_utils/json_test_inputs/ and
     combine them into a single dict.
 
     This is essentially the "Stage 0" mock payload used by:
-      - tests/mock_api_generate_cv.py
-      - tests/mock_api_generate_cv_v2.py
+      - tests_utils/mock_api_generate_cv.py
+      - tests_utils/mock_api_generate_cv_v2.py
 
     Returned structure:
     {

@@ -1,6 +1,6 @@
 """Unittest suite for Stage B generation engine.
 
-This module tests the core responsibilities of Stage B:
+This module tests_utils the core responsibilities of Stage B:
 
 - Internal helpers:
     - _truncate_text
@@ -15,7 +15,7 @@ This module tests the core responsibilities of Stage B:
 - End-to-end behaviour of:
     - CVGenerationEngine.generate_cv
 
-The tests use lightweight dummy objects instead of the full
+The tests_utils use lightweight dummy objects instead of the full
 CVGenerationRequest / template_info implementations to keep
 the Stage B contract focused on the *logical* fields used
 by the engine.
@@ -54,7 +54,7 @@ from unittest.mock import patch
 
 
 class DummyTemplateInfo:
-    """Minimal template_info-like object for Stage B tests.
+    """Minimal template_info-like object for Stage B tests_utils.
 
     Only the fields actually consumed by Stage B are provided:
     - template_id
@@ -67,7 +67,7 @@ class DummyTemplateInfo:
 
 
 class DummyRequest:
-    """Duck-typed request object for Stage B tests.
+    """Duck-typed request object for Stage B tests_utils.
 
     Only contains attributes accessed by CVGenerationEngine:
 
@@ -106,7 +106,7 @@ class DummyRequest:
 
 
 class DummyEvidence:
-    """Minimal Evidence-like object for prompt construction tests."""
+    """Minimal Evidence-like object for prompt construction tests_utils."""
 
     def __init__(self, evidence_id: str, fact: str) -> None:
         self.evidence_id = evidence_id
@@ -114,7 +114,7 @@ class DummyEvidence:
 
 
 class DummyEvidencePlan:
-    """Duck-typed EvidencePlan for prompt construction tests.
+    """Duck-typed EvidencePlan for prompt construction tests_utils.
 
     Attributes:
         section_hints: mapping from section_id to a list of evidence IDs.
@@ -602,7 +602,7 @@ class TestPromptBuilding(LoggingTestCase):
             self.assertIn("FACT_PROFILE", prompt_profile)
             self.assertIn("FACT_SKILL", prompt_profile)
         finally:
-            # Restore original load_parameters to avoid side effects on other tests
+            # Restore original load_parameters to avoid side effects on other tests_utils
             stage_b_generation._load_prompts_from_file = original_prompts_loader
 
     def test_section_specific_prompt_override_from_parameters(self) -> None:
@@ -654,7 +654,7 @@ class TestPromptBuilding(LoggingTestCase):
             # self.assertNotIn("DEFAULT PROMPT", prompt_exp)
 
         finally:
-            # Restore original loader so other tests are unaffected
+            # Restore original loader so other tests_utils are unaffected
             stage_b_generation._load_prompts_from_file = original_prompts_loader  # type: ignore[assignment]
 
 
@@ -721,7 +721,7 @@ class TestLLMRetries(LoggingTestCase):
 
 
 class TestEndToEndGeneration(LoggingTestCase):
-    """End-to-end tests for CVGenerationEngine.generate_cv."""
+    """End-to-end tests_utils for CVGenerationEngine.generate_cv."""
 
     def test_generate_cv_end_to_end_single_section_with_truncation(self) -> None:
         """End-to-end: LLM is called once, text is truncated, response schema is correct."""
@@ -793,7 +793,7 @@ class TestEndToEndGeneration(LoggingTestCase):
         self.assertTrue(content.endswith("…"))
 
     class TestEndToEndGeneration(LoggingTestCase):
-        """End-to-end tests for CVGenerationEngine.generate_cv."""
+        """End-to-end tests_utils for CVGenerationEngine.generate_cv."""
 
         def test_experience_header_and_bullets_only(self):
             """Experience section must render deterministic header + LLM-generated bullets only."""
@@ -835,8 +835,8 @@ class TestEndToEndGeneration(LoggingTestCase):
 
             resp = engine.generate_cv(req_typed)
 
-            # 1) LLM must have been called once for bullets
-            self.assertEqual(calls["n"], 1)
+            # 1) LLM is now called twice: augment + bullets
+            self.assertEqual(calls["n"], 2)
 
             # 2) Experience section must exist
             self.assertIn("experience", resp.sections)
@@ -905,14 +905,14 @@ class TestTrainingCleanup(LoggingTestCase):
         # The only remaining line should be 1 meaningful bullet
         cleaned = [ln for ln in text if ln.strip()]
         self.assertEqual(len(cleaned), 1)
-        self.assertTrue(cleaned[0].startswith("- Completed Intensive Python Bootcamp"))
+        self.assertEqual(cleaned[0], "- Completed Intensive Python Bootcamp (2021)")
 
         # Year extracted from training entry must be appended
         self.assertIn("2021", cleaned[0])
 
 
 # ---------------------------------------------------------------------------
-# Skills-specific tests (taxonomy-preserving behaviour)
+# Skills-specific tests_utils (taxonomy-preserving behaviour)
 # ---------------------------------------------------------------------------
 
 class TestSkillsStructuredGeneration(LoggingTestCase):
@@ -1133,16 +1133,23 @@ class TestSectionTokenBudgets(LoggingTestCase):
 
         # Stub call_llm_section_with_metrics so it just forwards to metrics_client.generate
         def fake_call_llm_section_with_metrics(
-            llm_client,
-            model: str,
-            prompt: str,
-            section_id: str,
-            purpose: str,
-            user_id: str,
-            messages: list | None = None,
+                llm_client,
+                model: str,
+                prompt: str,
+                section_id: str,
+                purpose: str,
+                user_id: str,
+                messages: list | None = None,
+                usage_callback=None,
         ):
-            # Keep the signature but ignore metrics; this allows us to see the
-            # max_output_tokens that Stage B passes to the underlying client.
+            # Ignore metrics and usage_callback; we only care about the
+            # max_output_tokens passed into the underlying client.
+            if usage_callback is not None:
+                try:
+                    usage_callback({"_source": "test"})
+                except Exception:
+                    pass
+
             return llm_client.generate(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
@@ -1308,11 +1315,11 @@ class TestStripMarkdownFence(LoggingTestCase):
 
 
 class TestZeroTokenRetry(LoggingTestCase):
-    """Zero-token responses are logged but do not trigger a re-try in Stage B.
+    """Zero-token responses trigger retries when configured in Stage B.
 
-    The llm_metrics layer records a zero-token snapshot, but Stage B currently
-    treats the call as successful and returns the empty text as-is, even when
-    `retry_on_zero_tokens` is True in generation_params.
+    The llm_metrics layer records a zero-token snapshot with a non-mock
+    usage source, so Stage B will retry up to max_retries and then return
+    the last (still empty) text.
     """
 
     def test_zero_token_does_not_retry(self) -> None:
@@ -1321,6 +1328,7 @@ class TestZeroTokenRetry(LoggingTestCase):
         class FakeResp:
             def __init__(self) -> None:
                 self.text = ""
+
                 # Mimic Gemini-style usage_metadata so llm_metrics treats it as real
                 class UM:
                     prompt_token_count = 0
@@ -1341,17 +1349,17 @@ class TestZeroTokenRetry(LoggingTestCase):
             llm_client=fake_llm,
             generation_params={
                 "max_retries": 2,
-                "retry_on_zero_tokens": True,  # currently has no effect in Stage B
+                "retry_on_zero_tokens": True,
             },
         )
 
         result = engine._call_llm_with_retries("x", "skills")
 
-        # ✅ Only one call was made (no retry on zero tokens)
-        self.assertEqual(calls["n"], 1)
+        # ✅ max_retries=2 → two attempts due to zero-token retry behaviour
+        self.assertEqual(calls["n"], 2)
 
-        # ✅ Result is the empty text coming from FakeResp.text
-        self.assertEqual(result, "")
+        # ✅ Result is still the empty text coming from FakeResp.text
+        self.assertEqual(result, "[ERROR: LLM returned zero tokens]")
 
 class TestSkillsAliasAndCombinedNames(LoggingTestCase):
     """Tests for alias mapping and dropping of combined canonical skills."""
@@ -1457,7 +1465,7 @@ class TestSkillsAliasAndCombinedNames(LoggingTestCase):
             stage_b_generation.is_combined_canonical_name = original_combined  # type: ignore[assignment]
 
 class TestSummarizeSkillsTelemetry(LoggingTestCase):
-    """Unit tests for _summarize_skills_telemetry helper."""
+    """Unit tests_utils for _summarize_skills_telemetry helper."""
 
     def test_telemetry_none_skills(self) -> None:
         metrics = _summarize_skills_telemetry(None)
@@ -1609,3 +1617,6 @@ class TestEducationPromptBuilding(LoggingTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+

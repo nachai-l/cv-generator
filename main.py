@@ -126,6 +126,17 @@ def run_cv_generation(
         evidence_plan=evidence_plan,
     )
     logger.info("stage_b_generation_done")
+    try:
+        llm_usage = LLMUsageSummary(
+            model=getattr(engine, "_model_name", "unknown"),
+            prompt_tokens=getattr(engine, "_stage_b_total_input_tokens", 0),
+            completion_tokens=getattr(engine, "_stage_b_total_output_tokens", 0),
+            total_tokens=getattr(engine, "_stage_b_total_tokens", 0),
+            total_cost_thb=getattr(engine, "_stage_b_total_cost_thb", 0.0),
+            total_cost_usd=getattr(engine, "_stage_b_total_cost_usd", 0.0),
+        )
+    except Exception:
+        llm_usage = None
 
     # ----------------------------- Stage C ------------------------------
     logger.info("stage_c_validation_start")
@@ -165,10 +176,11 @@ def run_cv_generation(
         request_id=request_id,
         user_id=user_id,
         profile_info=profile_info_dict,
-        llm_usage=llm_usage,
+        llm_usage=llm_usage,  # <—— ADD THIS
         generation_start=generation_start,
         generation_end=generation_end,
     )
+
     logger.info("stage_d_packaging_done", request_id=final_request_id)
 
     logger.info("pipeline_completed", user_id=user_id, request_id=final_request_id)

@@ -422,7 +422,7 @@ ID_TOKEN=$(gcloud auth print-identity-token)
 curl -X POST "$SERVICE_URL/generate_cv" \
   -H "Authorization: Bearer $ID_TOKEN" \
   -H "Content-Type: application/json" \
-  --data-binary @tests/api_payload_tests/test3.json
+  --data-binary @tests_utils/api_payload_tests/test3.json
 ```
 
 ---
@@ -496,7 +496,7 @@ curl -H "Authorization: Bearer $ID_TOKEN" "$SERVICE_URL/health"
 curl -X POST "$SERVICE_URL/generate_cv" \
   -H "Authorization: Bearer $ID_TOKEN" \
   -H "Content-Type: application/json" \
-  --data-binary @tests/api_payload_tests/test3.json
+  --data-binary @tests_utils/api_payload_tests/test3.json
 ```
 
 ---

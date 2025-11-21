@@ -207,7 +207,7 @@ class GuardrailsProcessor:
         Stage A itself still uses student_profile (via _resolve_profile), so this
         normalization does not change existing validation/evidence behaviour.
         """
-        # Legacy callers / tests already provide profile_info
+        # Legacy callers / tests_utils already provide profile_info
         if getattr(request, "profile_info", None) is not None:
             return request
 
