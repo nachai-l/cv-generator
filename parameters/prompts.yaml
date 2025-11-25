@@ -1,4 +1,4 @@
-# prompts.yaml
+# parameters/prompts.yaml
 #
 # Centralized prompt definitions for Stage B (CV generation).
 # Loaded via PROMPTS_FILE / _load_prompts_from_file() in stage_b_generation.py.
@@ -226,3 +226,155 @@ volunteering: |
     - the kind of work done,
     - any notable outcome or contribution.
   Keep the tone professional and aligned with the target role when possible.
+
+
+# -------------------------------------------------------------------
+# Justification to support claims and prevent hallucination
+# -------------------------------------------------------------------
+
+justification: |
+  After you write the section text normally, you must output a JSON justification block.
+  
+  FORMAT STEPS (VERY IMPORTANT):
+  1. First, write the section text as usual (no JSON).
+  2. Add a blank line.
+  3. Then write ONLY this separator on its own line:
+     === JUSTIFICATION_JSON ===
+  4. After the separator, output ONLY a valid JSON object with the following structure:
+  
+  {
+    "evidence_map": [
+      {
+        "section": "<SECTION_ID>",
+        "sentence": "<full sentence copied exactly from the generated section text>",
+        "evidence_ids": ["<evidence_ref_1>", "<evidence_ref_2>"],
+        "match_score": 0.0–1.0
+      }
+    ],
+    "unsupported_claims": [
+      {
+        "section": "<SECTION_ID>",
+        "claim": "<claim that is unsupported>",
+        "reason": "<explanation>",
+        "severity": "info" | "warning" | "error"
+      }
+    ],
+    "coverage_score": <float between 0.0 and 1.0>,
+    "total_claims_analyzed": <integer >= 0>
+  }
+  
+  STRICT RULES (FOLLOW EXACTLY):
+  
+  - Do NOT wrap the JSON in backticks or code fences.
+  - Do NOT output anything after the JSON.
+  - Allowed top-level keys:
+      evidence_map, unsupported_claims, coverage_score, total_claims_analyzed.
+  - Allowed keys inside evidence_map:
+      section, sentence, evidence_ids, match_score.
+  - Allowed keys inside unsupported_claims:
+      section, claim, reason, severity.
+  - IMPORTANT:
+      Do NOT include fields named "claim" or "source" inside evidence_map.
+  - <SECTION_ID> MUST match the current section, e.g.:
+        profile_summary, skills, education, experience, training
+  - "sentence" must be copied exactly from the generated text.
+  - "evidence_ids" must reference the input data, e.g.:
+        "student_profile.experience[0]", "profile_info.summary"
+  - JSON must be strictly valid: no comments, no trailing commas, no prose.
+  - If you are unsure about any value, use null. Do NOT use ranges, comments, or text like 0.0–1.0 inside numeric fields
+
+skills_structured_justification_suffix: |
+  After you output SKILLS_JSON exactly as described above, you must also output
+  a justification JSON block for the skills.
+
+  OUTPUT ORDER (VERY IMPORTANT):
+  1. First, output ONLY SKILLS_JSON (no extra text, no markdown).
+  2. Then write ONLY this separator on its own line:
+       === JUSTIFICATION_JSON ===
+  3. After the separator, output ONLY a valid JSON object with the following structure:
+
+     {
+       "evidence_map": [
+         {
+           "section": "skills",
+           "sentence": "<skill sentence or short phrase that would appear in the rendered skills section>",
+           "evidence_ids": ["<evidence_ref_1>", "<evidence_ref_2>"],
+           "match_score": 0.0–1.0
+         }
+       ],
+       "unsupported_claims": [
+         {
+           "section": "skills",
+           "claim": "<claim or skill that is unsupported>",
+           "reason": "<short explanation>",
+           "severity": "info" | "warning" | "error"
+         }
+       ],
+       "coverage_score": <float between 0.0 and 1.0>,
+       "total_claims_analyzed": <integer >= 0>
+     }
+
+  STRICT RULES:
+
+  - Do NOT wrap any JSON in backticks or code fences.
+  - Do NOT output anything before SKILLS_JSON.
+  - Do NOT output anything after the justification JSON.
+  - Allowed top-level keys in the justification JSON:
+      evidence_map, unsupported_claims, coverage_score, total_claims_analyzed.
+  - Allowed keys inside evidence_map:
+      section, sentence, evidence_ids, match_score.
+  - Allowed keys inside unsupported_claims:
+      section, claim, reason, severity.
+  - "section" must be "skills" for both evidence_map and unsupported_claims.
+  - "sentence" should match the phrasing of a skill or skill group that would
+    appear in the rendered skills section (e.g. "Molecular Biology (Advanced)").
+  - "evidence_ids" must reference the input data, e.g.:
+        "student_profile.experience[0]", "student_profile.education[1]", "profile_info.summary".
+  - JSON must be strictly valid: no comments, no trailing commas, no prose.
+
+experience_justification_json_only: |
+  You are given the final rendered CV section text above.
+
+  Your task is to output ONLY a JSON justification object for that section.
+
+  OUTPUT FORMAT (VERY IMPORTANT):
+  - Return ONLY a single JSON object (no other text).
+  - Do NOT output the CV section text again.
+  - Do NOT output "=== JUSTIFICATION_JSON ===".
+  - Do NOT wrap the JSON in backticks or code fences.
+
+  JSON SCHEMA:
+  {
+    "evidence_map": [
+      {
+        "section": "<SECTION_ID>",
+        "sentence": "<full sentence copied exactly from the generated section text>",
+        "evidence_ids": ["<evidence_ref_1>", "<evidence_ref_2>"],
+        "match_score": <float between 0.0 and 1.0>
+      }
+    ],
+    "unsupported_claims": [
+      {
+        "section": "<SECTION_ID>",
+        "claim": "<claim that is unsupported>",
+        "reason": "<explanation>",
+        "severity": "info" | "warning" | "error"
+      }
+    ],
+    "coverage_score": <float between 0.0 and 1.0>,
+    "total_claims_analyzed": <integer >= 0>
+  }
+
+  STRICT RULES:
+  - Allowed top-level keys:
+      evidence_map, unsupported_claims, coverage_score, total_claims_analyzed.
+  - Allowed keys inside evidence_map:
+      section, sentence, evidence_ids, match_score.
+  - Allowed keys inside unsupported_claims:
+      section, claim, reason, severity.
+  - <SECTION_ID> MUST match the current section, e.g. "experience".
+  - "sentence" must be copied exactly from the given section text above.
+  - "evidence_ids" must reference the input data, e.g.:
+      "student_profile.experience[0]", "profile_info.summary".
+  - JSON must be strictly valid: no comments, no trailing commas, no prose.
+  - If you are unsure about any value, use null. Do NOT use ranges, comments, or text like 0.0–1.0 inside numeric fields.

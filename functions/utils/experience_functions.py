@@ -298,76 +298,7 @@ def render_experience_header(entry: Any) -> str:
 
     # Fallback (rare)
     return ""
-#
-# def render_experience_header(entry: Any) -> str:
-#     """
-#     Render a deterministic two-line header for an experience entry.
-#
-#     Rules:
-#     - Prefer `position` over `title` over `job_title` as the role name.
-#     - Company is taken from `company` / `organization` / `employer`.
-#     - Years are derived from start/end date fields when available.
-#     - If no role/title exists, only the italic company line is returned.
-#     - If no dates are available, we don't fabricate any years.
-#
-#     Output examples:
-#         "**Assistant Manager, Research Division**\n"
-#         "*Mitsui Chemicals Singapore R&D Centre, 2017–2023*"
-#
-#         "*Mojia Biotech Pte. Ltd., 2023–Present*"
-#     """
-#     title = _first_non_empty(
-#         _get_attr_or_key(entry, "position"),
-#         _get_attr_or_key(entry, "title"),
-#         _get_attr_or_key(entry, "job_title"),
-#         _get_attr_or_key(entry, "role"),
-#     )
-#     company = _first_non_empty(
-#         _get_attr_or_key(entry, "company"),
-#         _get_attr_or_key(entry, "organization"),
-#         _get_attr_or_key(entry, "employer"),
-#     )
-#
-#     start_raw = _first_non_empty(
-#         _get_attr_or_key(entry, "year"),          # some schemas
-#         _get_attr_or_key(entry, "start_year"),
-#         _get_attr_or_key(entry, "startDate"),
-#         _get_attr_or_key(entry, "start_date"),
-#     )
-#     end_raw = _first_non_empty(
-#         _get_attr_or_key(entry, "end_year"),
-#         _get_attr_or_key(entry, "endDate"),
-#         _get_attr_or_key(entry, "end_date"),
-#     )
-#
-#     start_year = extract_year_from_date(start_raw)
-#     end_year = extract_year_from_date(end_raw)
-#
-#     years_part: Optional[str] = None
-#     if start_year and end_year:
-#         years_part = f"{start_year}–{end_year}"
-#     elif start_year and not end_year:
-#         years_part = f"{start_year}–Present"
-#     elif not start_year and end_year:
-#         years_part = end_year
-#
-#     lines: List[str] = []
-#
-#     if title:
-#         lines.append(f"**{title}**")
-#
-#     if company:
-#         if years_part:
-#             lines.append(f"*{company}| {years_part}*")
-#         else:
-#             lines.append(f"*{company}*")
-#
-#     if not lines and company:
-#         if years_part:
-#             return f"*{company}| {years_part}*"
-#         return f"*{company}*"
-#
-#     return "\n".join(lines)
+
 
 def render_experience_section_from_structured(
     items: Iterable[ExperienceItem],

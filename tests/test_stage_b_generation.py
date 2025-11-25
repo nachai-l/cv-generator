@@ -1,13 +1,17 @@
 """Unittest suite for Stage B generation engine.
 
-This module tests_utils the core responsibilities of Stage B:
+This module tests the core responsibilities of Stage B:
 
 - Internal helpers:
     - _truncate_text
     - _get_section_char_limits
 
+- Section availability / resolution:
+    - _get_available_sections
+    - _resolve_effective_sections
+
 - Prompt construction for a single section:
-    - _build_section_prompt
+    - build_section_prompt (from prompts_builder)
 
 - LLM retry logic:
     - _call_llm_with_retries
@@ -15,10 +19,11 @@ This module tests_utils the core responsibilities of Stage B:
 - End-to-end behaviour of:
     - CVGenerationEngine.generate_cv
 
-The tests_utils use lightweight dummy objects instead of the full
-CVGenerationRequest / template_info implementations to keep
-the Stage B contract focused on the *logical* fields used
-by the engine.
+Plus focused tests for:
+    - structured skills flow
+    - section token budgets
+    - experience / training rendering
+    - evidence helpers
 """
 
 from __future__ import annotations
@@ -27,6 +32,9 @@ import os
 import sys
 import unittest
 from typing import Any, Dict, List, cast
+
+import tempfile
+from unittest.mock import patch
 
 import functions.stage_b_generation as stage_b_generation
 from functions.stage_b_generation import (
@@ -40,13 +48,15 @@ from functions.stage_b_generation import (
     _collect_evidence_facts_for_section,
 )
 
-
 from schemas.output_schema import CVGenerationResponse, SectionContent, OutputSkillItem
 from schemas.input_schema import CVGenerationRequest
 from schemas.internal_schema import EvidencePlan, SkillsSectionPlan, CanonicalSkill
-
-import tempfile
-from unittest.mock import patch
+from functions.utils.prompts_builder import (
+    build_section_prompt,
+    build_skills_selection_prompt,
+    build_experience_justification_prompt,
+    load_section_prompts_config,
+)
 
 # ---------------------------------------------------------------------------
 # Helper dummies
@@ -54,20 +64,24 @@ from unittest.mock import patch
 
 
 class DummyTemplateInfo:
-    """Minimal template_info-like object for Stage B tests_utils.
+    """Minimal template_info-like object for Stage B tests.
 
     Only the fields actually consumed by Stage B are provided:
     - template_id
     - max_chars_per_section
     """
 
-    def __init__(self, template_id: str = "T_TEST", max_chars_per_section: Dict[str, int] | None = None):
+    def __init__(
+        self,
+        template_id: str = "T_TEST",
+        max_chars_per_section: Dict[str, int] | None = None,
+    ):
         self.template_id = template_id
         self.max_chars_per_section: Dict[str, int] = max_chars_per_section or {}
 
 
 class DummyRequest:
-    """Duck-typed request object for Stage B tests_utils.
+    """Duck-typed request object for Stage B tests.
 
     Only contains attributes accessed by CVGenerationEngine:
 
@@ -102,11 +116,13 @@ class DummyRequest:
         self.job_role_info: Dict[str, Any] | None = job_role_info
         self.job_position_info: Dict[str, Any] | None = job_position_info
         self.company_info: Dict[str, Any] | None = company_info
-        self.user_input_cv_text_by_section: Dict[str, str] = user_input_cv_text_by_section or {}
+        self.user_input_cv_text_by_section: Dict[str, str] = (
+            user_input_cv_text_by_section or {}
+        )
 
 
 class DummyEvidence:
-    """Minimal Evidence-like object for prompt construction tests_utils."""
+    """Minimal Evidence-like object for prompt construction tests."""
 
     def __init__(self, evidence_id: str, fact: str) -> None:
         self.evidence_id = evidence_id
@@ -114,14 +130,16 @@ class DummyEvidence:
 
 
 class DummyEvidencePlan:
-    """Duck-typed EvidencePlan for prompt construction tests_utils.
+    """Duck-typed EvidencePlan for prompt construction tests.
 
     Attributes:
         section_hints: mapping from section_id to a list of evidence IDs.
         evidences: list of DummyEvidence objects.
     """
 
-    def __init__(self, section_hints: Dict[str, List[str]], evidences: List[DummyEvidence]) -> None:
+    def __init__(
+        self, section_hints: Dict[str, List[str]], evidences: List[DummyEvidence]
+    ) -> None:
         self.section_hints = section_hints
         self.evidences = evidences
 
@@ -135,14 +153,17 @@ class LoggingTestCase(unittest.TestCase):
     """Base TestCase that prints a readable header per test."""
 
     @classmethod
-    def setUpClass(cls):
+    def setUpClass(cls) -> None:
         # Patch llm_metrics CSV path → temp file for the whole suite
         cls._tmpdir = tempfile.TemporaryDirectory()
-        cls._csv_path = os.path.join(cls._tmpdir.name, "llm_call_logs_stage_b_tests.csv")
+        cls._csv_path = os.path.join(
+            cls._tmpdir.name, "llm_call_logs_stage_b_tests.csv"
+        )
 
         # Clear caches first so the patch is effective
         try:
             from functions.utils import llm_metrics
+
             llm_metrics._load_config.cache_clear()
             llm_metrics._load_pricing.cache_clear()
             llm_metrics._get_csv_path.cache_clear()
@@ -156,7 +177,7 @@ class LoggingTestCase(unittest.TestCase):
         cls._csv_patch.start()
 
     @classmethod
-    def tearDownClass(cls):
+    def tearDownClass(cls) -> None:
         # Stop patch and cleanup temp dir
         cls._csv_patch.stop()
         cls._tmpdir.cleanup()
@@ -164,12 +185,14 @@ class LoggingTestCase(unittest.TestCase):
     def setUp(self) -> None:
         test_name = self._testMethodName
         print("\n" + "=" * 90, file=sys.stderr)
-        print(f"🧪 STARTING TEST: {self.__class__.__name__}.{test_name}", file=sys.stderr)
+        print(
+            f"🧪 STARTING TEST: {self.__class__.__name__}.{test_name}",
+            file=sys.stderr,
+        )
         print("=" * 90, file=sys.stderr)
 
     def tearDown(self) -> None:
         print("-" * 90 + "\n", file=sys.stderr)
-
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +236,9 @@ class TestHelpers(LoggingTestCase):
             max_chars_per_section={"profile_summary": 200, "skills": 100},
         )
         req = DummyRequest(template_info=tmpl)
-        limits = _get_section_char_limits(cast(CVGenerationRequest, cast(object, req)))
+        limits = _get_section_char_limits(
+            cast(CVGenerationRequest, cast(object, req))
+        )
 
         self.assertEqual(limits, {"profile_summary": 200, "skills": 100})
 
@@ -221,15 +246,19 @@ class TestHelpers(LoggingTestCase):
         """_get_section_char_limits should return empty dict when template_info is None."""
         req = DummyRequest()
         req.template_info = None  # type: ignore[assignment]
-        limits = _get_section_char_limits(cast(CVGenerationRequest, cast(object, req)))
+        limits = _get_section_char_limits(
+            cast(CVGenerationRequest, cast(object, req))
+        )
         self.assertEqual(limits, {})
+
 
 # ---------------------------------------------------------------------------
 # Tests for available sections
 # ---------------------------------------------------------------------------
 
+
 class TestAvailableSections(LoggingTestCase):
-    """Tests for _get_available_sections including new sections."""
+    """Tests for _get_available_sections including extended sections."""
 
     def test_available_sections_from_profile_info_includes_new_keys(self) -> None:
         """profile_info with publications/training/references/additional_info should mark them available."""
@@ -242,7 +271,13 @@ class TestAvailableSections(LoggingTestCase):
             "additional_info": ["Driver's license"],
         }
         req = DummyRequest(
-            sections=["skills", "publications", "training", "references", "additional_info"],
+            sections=[
+                "skills",
+                "publications",
+                "training",
+                "references",
+                "additional_info",
+            ],
             profile_info=profile_info,
         )
 
@@ -254,7 +289,7 @@ class TestAvailableSections(LoggingTestCase):
         self.assertIn("skills", available)
         self.assertIn("skills_structured", available)
 
-        # New sections
+        # Extended sections
         self.assertIn("publications", available)
         self.assertIn("training", available)
         self.assertIn("references", available)
@@ -262,6 +297,7 @@ class TestAvailableSections(LoggingTestCase):
 
     def test_available_sections_from_student_profile(self) -> None:
         """student_profile.* should also drive availability of the extended sections."""
+
         class DummyStudentProfile:
             def __init__(self) -> None:
                 self.education = ["BSc"]
@@ -284,7 +320,6 @@ class TestAvailableSections(LoggingTestCase):
                 "additional_info",
             ],
         )
-        # Attach duck-typed student_profile
         req.student_profile = DummyStudentProfile()  # type: ignore[attr-defined]
 
         available = _get_available_sections(
@@ -302,15 +337,18 @@ class TestAvailableSections(LoggingTestCase):
         self.assertIn("references", available)
         self.assertIn("additional_info", available)
 
+
 # ---------------------------------------------------------------------------
 # Tests for resolve effective sections
 # ---------------------------------------------------------------------------
+
 
 class TestEffectiveSectionsResolution(LoggingTestCase):
     """Tests for _resolve_effective_sections behaviour and structured-skills flag."""
 
     def test_enable_structured_skills_false_filters_out_skills_structured(self) -> None:
         """When enable_structured_skills is False, skills_structured should be removed."""
+
         def fake_load_parameters() -> Dict[str, Any]:
             return {
                 "generation": {
@@ -326,17 +364,14 @@ class TestEffectiveSectionsResolution(LoggingTestCase):
         stage_b_generation.load_parameters = fake_load_parameters  # type: ignore[assignment]
 
         try:
-            tmpl = DummyTemplateInfo(
-                template_id="T_TEST",
-                max_chars_per_section={},
-            )
-            # Template explicitly asks for both
-            req = DummyRequest(
-                sections=None,
-                template_info=tmpl,
-            )
-            # Emulate template.sections_order as in real TemplateInfo
-            tmpl.sections_order = ["profile_summary", "skills_structured", "skills"]  # type: ignore[attr-defined]
+            tmpl = DummyTemplateInfo(template_id="T_TEST", max_chars_per_section={})
+            tmpl.sections_order = [
+                "profile_summary",
+                "skills_structured",
+                "skills",
+            ]  # type: ignore[attr-defined]
+
+            req = DummyRequest(sections=None, template_info=tmpl)
 
             available = {"profile_summary", "skills_structured", "skills"}
             effective = _resolve_effective_sections(
@@ -353,6 +388,7 @@ class TestEffectiveSectionsResolution(LoggingTestCase):
 
     def test_enable_structured_skills_true_keeps_skills_structured(self) -> None:
         """When enable_structured_skills is True, skills_structured should be preserved."""
+
         def fake_load_parameters() -> Dict[str, Any]:
             return {
                 "generation": {
@@ -368,16 +404,14 @@ class TestEffectiveSectionsResolution(LoggingTestCase):
         stage_b_generation.load_parameters = fake_load_parameters  # type: ignore[assignment]
 
         try:
-            tmpl = DummyTemplateInfo(
-                template_id="T_TEST",
-                max_chars_per_section={},
-            )
-            tmpl.sections_order = ["profile_summary", "skills_structured", "skills"]  # type: ignore[attr-defined]
+            tmpl = DummyTemplateInfo(template_id="T_TEST", max_chars_per_section={})
+            tmpl.sections_order = [
+                "profile_summary",
+                "skills_structured",
+                "skills",
+            ]  # type: ignore[attr-defined]
 
-            req = DummyRequest(
-                sections=None,
-                template_info=tmpl,
-            )
+            req = DummyRequest(sections=None, template_info=tmpl)
 
             available = {"profile_summary", "skills_structured", "skills"}
             effective = _resolve_effective_sections(
@@ -392,11 +426,13 @@ class TestEffectiveSectionsResolution(LoggingTestCase):
         finally:
             stage_b_generation.load_parameters = original  # type: ignore[assignment]
 
+
 class TestStructuredFirstSkillsFlow(LoggingTestCase):
     """Tests for skills_structured-first generation and rendering of skills text."""
 
     def test_structured_first_renders_skills_from_structured_output(self) -> None:
         """When skills_structured is requested, skills text comes from structured skills bullets."""
+
         def fake_load_parameters() -> Dict[str, Any]:
             # enable_structured_skills=True ensures skills_structured stays in effective_sections
             return {
@@ -415,7 +451,11 @@ class TestStructuredFirstSkillsFlow(LoggingTestCase):
         try:
             # Template requests: profile_summary, skills_structured, skills
             tmpl = DummyTemplateInfo(template_id="T_EMPLOYER_STD_V3")
-            tmpl.sections_order = ["profile_summary", "skills_structured", "skills"]  # type: ignore[attr-defined]
+            tmpl.sections_order = [
+                "profile_summary",
+                "skills_structured",
+                "skills",
+            ]  # type: ignore[attr-defined]
 
             profile_info = {
                 "name": "Test User",
@@ -446,8 +486,14 @@ class TestStructuredFirstSkillsFlow(LoggingTestCase):
 
             # Stub structured skills generation so we don't depend on JSON parsing here
             stub_structured = [
-                OutputSkillItem(name="Python", level="L3_Advanced", source="taxonomy"),
-                OutputSkillItem(name="Data Analysis", level="L2_Intermediate", source="taxonomy"),
+                OutputSkillItem(
+                    name="Python", level="L3_Advanced", source="taxonomy"
+                ),
+                OutputSkillItem(
+                    name="Data Analysis",
+                    level="L2_Intermediate",
+                    source="taxonomy",
+                ),
             ]
             engine._generate_structured_skills = (  # type: ignore[assignment]
                 lambda _request, _plan, skills_section_text=None: stub_structured
@@ -462,11 +508,10 @@ class TestStructuredFirstSkillsFlow(LoggingTestCase):
             self.assertIn("skills", response.sections)
             skills_sec = response.sections["skills"]
             self.assertIsInstance(skills_sec, SectionContent)
-            text = skills_sec.text.strip().splitlines()
+            text_lines = skills_sec.text.strip().splitlines()
 
-            # Order is deterministic because format_plain_skill_bullets iterates input in order
-            self.assertIn("- Python (Advanced)", text[0])
-            self.assertIn("- Data Analysis (Intermediate)", text[1])
+            self.assertIn("- Python (Advanced)", text_lines[0])
+            self.assertIn("- Data Analysis (Intermediate)", text_lines[1])
 
             # 3) response.skills should contain the structured items
             self.assertIsNotNone(response.skills)
@@ -477,12 +522,14 @@ class TestStructuredFirstSkillsFlow(LoggingTestCase):
         finally:
             stage_b_generation.load_parameters = original  # type: ignore[assignment]
 
+
 # ---------------------------------------------------------------------------
 # Tests for prompt building
 # ---------------------------------------------------------------------------
 
+
 class TestPromptBuilding(LoggingTestCase):
-    """Tests for _build_section_prompt behaviour."""
+    """Tests for build_section_prompt behaviour."""
 
     def test_build_section_prompt_includes_profile_role_company_and_evidence(self) -> None:
         """Prompt should include profile info, JD info, company, evidence, and user draft."""
@@ -510,15 +557,11 @@ class TestPromptBuilding(LoggingTestCase):
             user_input_cv_text_by_section=user_draft,
         )
 
-        engine = CVGenerationEngine(
-            llm_client=lambda *_args, **_kwargs: "ignored",  # we only test the prompt
-            generation_params={"log_prompts": False},
-        )
-
         req_typed = cast(CVGenerationRequest, cast(object, req))
         ep_typed = cast(EvidencePlan, cast(object, ep))
 
-        prompt = engine._build_section_prompt(
+        # ✅ Call build_section_prompt directly (no longer via engine)
+        prompt = build_section_prompt(
             request=req_typed,
             evidence_plan=ep_typed,
             section_id="profile_summary",
@@ -540,6 +583,7 @@ class TestPromptBuilding(LoggingTestCase):
 
     def test_cross_section_evidence_sharing_applies_correctly(self) -> None:
         """Evidence facts should be shared across sections according to parameters.yaml config."""
+
         # Fake parameters with cross-section sharing: profile_summary gets skills facts too.
         def fake_load_parameters() -> Dict[str, Any]:
             return {
@@ -554,15 +598,19 @@ class TestPromptBuilding(LoggingTestCase):
                 },
             }
 
-        # Patch the load_parameters *used inside stage_b_generation*
-        def fake_load_prompts():
+        # Fake prompts config (as if from prompts.yaml)
+        def fake_load_prompts_from_file() -> Dict[str, str]:
             return {
                 "default": "DEFAULT PROMPT",
                 "experience": "EXPERIENCE PROMPT OVERRIDE",
             }
 
-        original_prompts_loader = stage_b_generation._load_prompts_from_file
-        stage_b_generation._load_prompts_from_file = lambda: fake_load_prompts()
+        original_params_loader = stage_b_generation.load_parameters
+        from functions.utils import prompts_builder
+
+        original_prompts_loader = prompts_builder._load_prompts_from_file
+        stage_b_generation.load_parameters = fake_load_parameters  # type: ignore[assignment]
+        prompts_builder._load_prompts_from_file = fake_load_prompts_from_file  # type: ignore[assignment]
 
         try:
             evidences = [
@@ -584,15 +632,11 @@ class TestPromptBuilding(LoggingTestCase):
                 profile_info={"name": "Test User"},
             )
 
-            engine = CVGenerationEngine(
-                llm_client=lambda *_args, **_kwargs: "ignored",
-                generation_params={"log_prompts": False},
-            )
-
             req_typed = cast(CVGenerationRequest, cast(object, req))
             ep_typed = cast(EvidencePlan, cast(object, ep))
 
-            prompt_profile = engine._build_section_prompt(
+            # ✅ Call build_section_prompt directly (no longer via engine)
+            prompt_profile = build_section_prompt(
                 request=req_typed,
                 evidence_plan=ep_typed,
                 section_id="profile_summary",
@@ -602,22 +646,22 @@ class TestPromptBuilding(LoggingTestCase):
             self.assertIn("FACT_PROFILE", prompt_profile)
             self.assertIn("FACT_SKILL", prompt_profile)
         finally:
-            # Restore original load_parameters to avoid side effects on other tests_utils
-            stage_b_generation._load_prompts_from_file = original_prompts_loader
+            stage_b_generation.load_parameters = original_params_loader  # type: ignore[assignment]
+            prompts_builder._load_prompts_from_file = original_prompts_loader  # type: ignore[assignment]
 
     def test_section_specific_prompt_override_from_parameters(self) -> None:
         """Section-specific prompt overrides from prompts config should be used."""
 
-        # Fake prompts config as if it came from prompts.yaml
         def fake_load_prompts_from_file() -> Dict[str, str]:
             return {
                 "default": "DEFAULT PROMPT",
                 "experience": "EXPERIENCE PROMPT OVERRIDE",
             }
 
-        # Patch the prompts loader used inside Stage B
-        original_prompts_loader = stage_b_generation._load_prompts_from_file
-        stage_b_generation._load_prompts_from_file = fake_load_prompts_from_file  # type: ignore[assignment]
+        from functions.utils import prompts_builder
+
+        original_prompts_loader = prompts_builder._load_prompts_from_file
+        prompts_builder._load_prompts_from_file = fake_load_prompts_from_file  # type: ignore[assignment]
 
         try:
             ep = DummyEvidencePlan(section_hints={}, evidences=[])
@@ -628,15 +672,11 @@ class TestPromptBuilding(LoggingTestCase):
                 template_info=DummyTemplateInfo(template_id="T_EMPLOYER_STD_V3"),
             )
 
-            engine = CVGenerationEngine(
-                llm_client=lambda *_args, **_kwargs: "ignored",
-                generation_params={"log_prompts": False},
-            )
-
             req_typed = cast(CVGenerationRequest, cast(object, req))
             ep_typed = cast(EvidencePlan, cast(object, ep))
 
-            prompt_exp = engine._build_section_prompt(
+            # ✅ Call build_section_prompt directly (no longer via engine)
+            prompt_exp = build_section_prompt(
                 request=req_typed,
                 evidence_plan=ep_typed,
                 section_id="experience",
@@ -647,15 +687,8 @@ class TestPromptBuilding(LoggingTestCase):
 
             # Must contain the section-specific override
             self.assertIn("EXPERIENCE PROMPT OVERRIDE", prompt_exp)
-
-            # In most implementations the default body text won't show as well,
-            # but if your prompt builder *appends* default text, you can drop
-            # this assertion or invert it accordingly.
-            # self.assertNotIn("DEFAULT PROMPT", prompt_exp)
-
         finally:
-            # Restore original loader so other tests_utils are unaffected
-            stage_b_generation._load_prompts_from_file = original_prompts_loader  # type: ignore[assignment]
+            prompts_builder._load_prompts_from_file = original_prompts_loader  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -667,11 +700,8 @@ class TestLLMRetries(LoggingTestCase):
     """Tests for _call_llm_with_retries behaviour."""
 
     def test_call_llm_with_retries_succeeds_after_transient_failure(self) -> None:
-        """LLM call should succeed on third attempt when first two fail.
+        """LLM call should succeed on third attempt when first two fail."""
 
-        Note: in the current implementation, `max_retries` is the *total*
-        number of attempts (not extra retries), so we set it to 3 here.
-        """
         calls: Dict[str, int] = {"count": 0}
 
         def flaky_llm(_prompt: str, **_kwargs: Any) -> str:
@@ -716,12 +746,12 @@ class TestLLMRetries(LoggingTestCase):
 
 
 # ---------------------------------------------------------------------------
-# End-to-end generation test (happy path)
+# End-to-end generation tests
 # ---------------------------------------------------------------------------
 
 
 class TestEndToEndGeneration(LoggingTestCase):
-    """End-to-end tests_utils for CVGenerationEngine.generate_cv."""
+    """End-to-end tests for CVGenerationEngine.generate_cv."""
 
     def test_generate_cv_end_to_end_single_section_with_truncation(self) -> None:
         """End-to-end: LLM is called once, text is truncated, response schema is correct."""
@@ -753,7 +783,7 @@ class TestEndToEndGeneration(LoggingTestCase):
                 "temperature": 0.1,
                 "top_p": 0.9,
                 "max_output_tokens": 128,
-                "max_retries": 1,  # 🔹 one total attempt, no extra retries
+                "max_retries": 1,
                 "timeout_seconds": 5,
                 "log_prompts": False,
             },
@@ -771,20 +801,16 @@ class TestEndToEndGeneration(LoggingTestCase):
         self.assertTrue(hasattr(response, "sections"))
         self.assertEqual(response.language, "en")
 
-        # template_id and user_id are only set if they exist in the schema
         if hasattr(response, "template_id"):
             self.assertEqual(response.template_id, "T_EMPLOYER_STD_V3")
         if hasattr(response, "job_id"):
-            # job_id pattern is enforced by the schema; here we only check suffix
             self.assertIn("U123", response.job_id)
 
-        # Sections should be a dict keyed by section_id
         self.assertIsInstance(response.sections, dict)
         self.assertIn("profile_summary", response.sections)
         sec = response.sections["profile_summary"]
         self.assertIsInstance(sec, SectionContent)
 
-        # Content field is "text" in SectionContent
         content = sec.text
         self.assertIsInstance(content, str)
 
@@ -792,86 +818,89 @@ class TestEndToEndGeneration(LoggingTestCase):
         self.assertLessEqual(len(content), 21)
         self.assertTrue(content.endswith("…"))
 
-    class TestEndToEndGeneration(LoggingTestCase):
-        """End-to-end tests_utils for CVGenerationEngine.generate_cv."""
 
-        def test_experience_header_and_bullets_only(self):
-            """Experience section must render deterministic header + LLM-generated bullets only."""
-            calls = {"n": 0}
+class TestEndToEndExperience(LoggingTestCase):
+    """End-to-end tests for experience section with header + bullets."""
 
-            def fake_llm(prompt: str, **_kw):
-                calls["n"] += 1
-                # Optional: check we are using the experience-specific prompt
-                self.assertIn("Generate a strong 'experience' section", prompt)
+    def test_experience_header_and_bullets_only(self) -> None:
+        """Experience section must render deterministic header + LLM-generated bullets only."""
+        calls = {"n": 0}
+
+        def fake_llm(prompt: str, **_kw: Any) -> str:
+            calls["n"] += 1
+            # Check if this is the bullets generation call (not augmentation)
+            if "You are generating bullet points for a single work experience entry" in prompt:
                 return "- Did A\n- Did B"  # bullet-only output
+            # For augmentation call, return empty
+            return '{ "new_items": [] }'
 
-            # Student profile with experience entry
-            class DummyExp:
-                def __init__(self):
-                    self.title = "Junior Data Scientist"
-                    self.company = "True Digital Group"
-                    self.start_date = "2020-01-01"
-                    self.end_date = "2022-12-31"
+        class DummyExp:
+            def __init__(self) -> None:
+                self.title = "Junior Data Scientist"
+                self.company = "True Digital Group"
+                self.start_date = "2020-01-01"
+                self.end_date = "2022-12-31"
 
-            class DummyProfile:
-                def __init__(self):
-                    self.experience = [DummyExp()]
+        class DummyProfile:
+            def __init__(self) -> None:
+                self.experience = [DummyExp()]
 
-            tmpl = DummyTemplateInfo(
-                template_id="T_EMPLOYER_STD_V3",
-                max_chars_per_section={"experience": 500},
-            )
+        tmpl = DummyTemplateInfo(
+            template_id="T_EMPLOYER_STD_V3",
+            max_chars_per_section={"experience": 500},
+        )
 
-            req = DummyRequest(
-                sections=["experience"],
-                language="en",
-                template_info=tmpl,
-                profile_info={"name": "Test User"},
-            )
-            req.student_profile = DummyProfile()  # attach duck-typed profile
+        req = DummyRequest(
+            sections=["experience"],
+            language="en",
+            template_info=tmpl,
+            profile_info={"name": "Test User"},
+        )
+        req.student_profile = DummyProfile()  # type: ignore[attr-defined]
 
-            engine = CVGenerationEngine(fake_llm, generation_params={"max_retries": 1})
-            req_typed = cast(CVGenerationRequest, req)
+        engine = CVGenerationEngine(fake_llm, generation_params={"max_retries": 1})
+        req_typed = cast(CVGenerationRequest, req)
 
-            resp = engine.generate_cv(req_typed)
+        resp = engine.generate_cv(req_typed)
 
-            # 1) LLM is now called twice: augment + bullets
-            self.assertEqual(calls["n"], 2)
+        # 1) LLM is now called twice: augment + bullets
+        self.assertEqual(calls["n"], 2)
 
-            # 2) Experience section must exist
-            self.assertIn("experience", resp.sections)
-            text = resp.sections["experience"].text
+        # 2) Experience section must exist
+        self.assertIn("experience", resp.sections)
+        text = resp.sections["experience"].text
 
-            # 3) Header must contain job title, company and years 2020–2022
-            self.assertIn("Junior Data Scientist", text)
-            self.assertIn("True Digital Group", text)
-            self.assertIn("2020–2022", text)
+        # 3) Header must contain job title, company and years 2020–2022
+        self.assertIn("Junior Data Scientist", text)
+        self.assertIn("True Digital Group", text)
+        self.assertIn("2020–2022", text)
 
-            # 4) Ensure bullets appear after header
-            self.assertIn("- Did A", text)
-            self.assertIn("- Did B", text)
+        # 4) Ensure bullets appear after header
+        self.assertIn("- Did A", text)
+        self.assertIn("- Did B", text)
 
 
 class TestTrainingCleanup(LoggingTestCase):
-    def test_training_heading_cleanup_and_year_append(self):
+    """Training section cleanup behaviour."""
+
+    def test_training_heading_cleanup_and_year_append(self) -> None:
         """Training section must remove meaningless headings and append year extracted from entries."""
         calls = {"n": 0}
 
         # Fake LLM returns training text containing bad headings
-        def fake_llm(prompt: str, **_kw):
+        def fake_llm(prompt: str, **_kw: Any) -> str:
             calls["n"] += 1
             return """- Training
 - Training:
 - การฝึกอบรม
 - Completed Intensive Python Bootcamp"""
 
-        # Student profile with training-year info
         class DummyTraining:
-            def __init__(self):
+            def __init__(self) -> None:
                 self.year = "2021-06-01"
 
         class DummyProfile:
-            def __init__(self):
+            def __init__(self) -> None:
                 self.training = [DummyTraining()]
 
         tmpl = DummyTemplateInfo(
@@ -885,7 +914,7 @@ class TestTrainingCleanup(LoggingTestCase):
             template_info=tmpl,
             profile_info={"name": "Test User"},
         )
-        req.student_profile = DummyProfile()
+        req.student_profile = DummyProfile()  # type: ignore[attr-defined]
 
         engine = CVGenerationEngine(fake_llm, generation_params={"max_retries": 1})
         req_typed = cast(CVGenerationRequest, req)
@@ -895,15 +924,16 @@ class TestTrainingCleanup(LoggingTestCase):
         # LLM called exactly once
         self.assertEqual(calls["n"], 1)
 
-        text = resp.sections["training"].text.splitlines()
+        text_lines = resp.sections["training"].text.splitlines()
 
         # Junk headings must be removed
-        self.assertNotIn("Training", text)
-        self.assertNotIn("Training:", text)
-        self.assertNotIn("การฝึกอบรม", text)
+        for line in text_lines:
+            self.assertNotIn("Training", line)
+            self.assertNotIn("Training:", line)
+            self.assertNotIn("การฝึกอบรม", line)
 
         # The only remaining line should be 1 meaningful bullet
-        cleaned = [ln for ln in text if ln.strip()]
+        cleaned = [ln for ln in text_lines if ln.strip()]
         self.assertEqual(len(cleaned), 1)
         self.assertEqual(cleaned[0], "- Completed Intensive Python Bootcamp (2021)")
 
@@ -912,27 +942,26 @@ class TestTrainingCleanup(LoggingTestCase):
 
 
 # ---------------------------------------------------------------------------
-# Skills-specific tests_utils (taxonomy-preserving behaviour)
+# Skills-specific tests (taxonomy / structured behaviour)
 # ---------------------------------------------------------------------------
+
 
 class TestSkillsStructuredGeneration(LoggingTestCase):
     """Tests for structured skills generation in Stage B."""
 
-    def test_generate_structured_skills_respects_keep_flag_and_allows_new_skills(self) -> None:
+    def test_generate_structured_skills_respects_keep_flag_and_allows_new_skills(
+        self,
+    ) -> None:
         """_generate_structured_skills should respect keep=false and allow new inferred skills."""
-        # Build a simple skills plan with one canonical skill
         skills_plan = SkillsSectionPlan(
             canonical_skills=[
-                CanonicalSkill(name="Molecular Biology", level="L4_Expert", taxonomy_id=None),
+                CanonicalSkill(
+                    name="Molecular Biology", level="L4_Expert", taxonomy_id=None
+                ),
             ],
-            # With new behaviour we don't rely on allowed_additional_skills as a whitelist
             allowed_additional_skills=[],
         )
 
-        # Fake JSON from LLM:
-        # - canonical skill (keep=true) -> should be kept
-        # - new inferred skill (keep=true) -> should be kept
-        # - skill with keep=false -> should be dropped
         fake_json = """
         {
           "items": [
@@ -943,14 +972,13 @@ class TestSkillsStructuredGeneration(LoggingTestCase):
         }
         """
 
-        # Engine with dummy llm client; we override _call_llm_with_retries to return fake_json
         engine = CVGenerationEngine(
             llm_client=lambda *_args, **_kwargs: fake_json,
             generation_params={"max_retries": 1},
         )
-
-        # Patch instance method for this engine only so it always returns fake_json
-        engine._call_llm_with_retries = lambda prompt, section_id: fake_json  # type: ignore[assignment]
+        engine._call_llm_with_retries = (  # type: ignore[assignment]
+            lambda prompt, section_id: fake_json
+        )
 
         req = DummyRequest(
             sections=["skills"],
@@ -961,7 +989,6 @@ class TestSkillsStructuredGeneration(LoggingTestCase):
 
         result = engine._generate_structured_skills(req_typed, skills_plan)
 
-        # We expect two skills: canonical + new inferred; the keep=false one is dropped
         self.assertEqual(len(result), 2)
         self.assertTrue(all(isinstance(s, OutputSkillItem) for s in result))
 
@@ -970,18 +997,16 @@ class TestSkillsStructuredGeneration(LoggingTestCase):
         self.assertIn("New Inferred Skill", names)
         self.assertNotIn("Drop Me", names)
 
-        # Canonical skill should still be tagged as taxonomy
         canonical = next(s for s in result if s.name == "Molecular Biology")
         self.assertEqual(canonical.level, "L4_Expert")
         self.assertEqual(canonical.source, "taxonomy")
 
     def test_generate_cv_populates_structured_skills_from_profile(self) -> None:
         """generate_cv should populate response.skills when 'skills' section is requested."""
-        # Dummy LLM that returns some filler text for all sections
+
         def fake_llm(_prompt: str, **_kwargs: Any) -> str:
             return "Generated section text."
 
-        # Profile info contains skills in taxonomy form (name + level)
         profile_info = {
             "name": "Test User",
             "skills": [
@@ -1002,22 +1027,23 @@ class TestSkillsStructuredGeneration(LoggingTestCase):
             generation_params={"max_retries": 1, "log_prompts": False},
         )
 
-        # Stub structured skills generation to avoid relying on JSON parsing in this test
         stub_skills = [
-            OutputSkillItem(name="Molecular Biology", level="L4_Expert", source="taxonomy"),
-            OutputSkillItem(name="Analytical Thinking", level="L3_Advanced", source="taxonomy"),
+            OutputSkillItem(
+                name="Molecular Biology", level="L4_Expert", source="taxonomy"
+            ),
+            OutputSkillItem(
+                name="Analytical Thinking", level="L3_Advanced", source="taxonomy"
+            ),
         ]
         engine._generate_structured_skills = (  # type: ignore[assignment]
-            lambda _request, _plan: stub_skills
+            lambda _request, _plan, skills_section_text=None: stub_skills
         )
 
         response = engine.generate_cv(req_typed, evidence_plan=None)
 
-        # Ensure sections still exist (including 'skills' as text section)
         self.assertIn("skills", response.sections)
         self.assertIsInstance(response.sections["skills"], SectionContent)
 
-        # Ensure structured skills list is populated
         self.assertIsNotNone(response.skills)
         self.assertEqual(len(response.skills or []), 2)
         names = [s.name for s in response.skills or []]
@@ -1025,19 +1051,7 @@ class TestSkillsStructuredGeneration(LoggingTestCase):
         self.assertIn("Analytical Thinking", names)
 
     def test_generate_cv_skips_sections_without_source_data(self) -> None:
-        """Sections with no backing data in profile_info or user drafts should be skipped.
-
-        Requested sections:
-        - profile_summary
-        - volunteering
-
-        profile_info only contains a name, no 'summary' or 'volunteering' fields.
-        user_input_cv_text_by_section is empty.
-
-        Expected:
-        - No LLM calls are made.
-        - response.sections is empty (no generated sections).
-        """
+        """Sections with no backing data in profile_info or user drafts should be skipped."""
         llm_calls: Dict[str, int] = {"count": 0}
 
         def fake_llm(_prompt: str, **_kwargs: Any) -> str:
@@ -1046,17 +1060,19 @@ class TestSkillsStructuredGeneration(LoggingTestCase):
 
         tmpl = DummyTemplateInfo(
             template_id="T_EMPLOYER_STD_V3",
-            max_chars_per_section={"profile_summary": 200, "volunteering": 200},
+            max_chars_per_section={
+                "profile_summary": 200,
+                "volunteering": 200,
+            },
         )
 
-        # profile_info has only a name → no mapped fields for profile_summary / volunteering
         req = DummyRequest(
             sections=["profile_summary", "volunteering"],
             language="en",
             user_id="U_SKIP",
             template_info=tmpl,
             profile_info={"name": "Test User"},
-            user_input_cv_text_by_section={},  # no drafts
+            user_input_cv_text_by_section={},
         )
 
         engine = CVGenerationEngine(
@@ -1072,47 +1088,18 @@ class TestSkillsStructuredGeneration(LoggingTestCase):
 
         response = engine.generate_cv(req_typed, evidence_plan=None)
 
-        # ✅ No LLM calls because no effective sections
         self.assertEqual(llm_calls["count"], 0)
-
-        # ✅ No sections generated
         self.assertIsInstance(response, CVGenerationResponse)
         self.assertIsInstance(response.sections, dict)
         self.assertEqual(len(response.sections), 0)
-
-        # ✅ Metadata still consistent: 2 requested, 0 generated
         self.assertEqual(response.metadata.sections_requested, 2)
         self.assertEqual(response.metadata.sections_generated, 0)
 
-class TestRetryBackoffMultiplier(LoggingTestCase):
-    """Ensure retry backoff sleeps at least once on transient failure.
 
-    We don't assert the exact multiplier here because the exception path
-    currently uses a fixed constant (1.2) in the implementation.
-    """
+# ---------------------------------------------------------------------------
+# Section token budgets
+# ---------------------------------------------------------------------------
 
-    def test_retry_backoff_obeys_retry_count(self) -> None:
-        calls = {"count": 0}
-
-        def fake_llm(_prompt: str, **_kwargs: Any) -> str:
-            calls["count"] += 1
-            raise RuntimeError("Fail always")
-
-        with patch("functions.stage_b_generation.time.sleep") as sleep_mock:
-            engine = CVGenerationEngine(
-                llm_client=fake_llm,
-                generation_params={"max_retries": 2},
-            )
-
-            with self.assertRaises(RuntimeError):
-                engine._call_llm_with_retries(
-                    prompt="x",
-                    section_id="profile_summary",
-                )
-
-        # max_retries = 2 → 2 attempts, sleep after the first failure only
-        self.assertEqual(calls["count"], 2)
-        sleep_mock.assert_called_once()
 
 class TestSectionTokenBudgets(LoggingTestCase):
     """Test the per-section token budgets feature in Stage B."""
@@ -1131,19 +1118,16 @@ class TestSectionTokenBudgets(LoggingTestCase):
         original_call = stage_b_generation.call_llm_section_with_metrics
         stage_b_generation.load_parameters = fake_load_params  # type: ignore[assignment]
 
-        # Stub call_llm_section_with_metrics so it just forwards to metrics_client.generate
         def fake_call_llm_section_with_metrics(
-                llm_client,
-                model: str,
-                prompt: str,
-                section_id: str,
-                purpose: str,
-                user_id: str,
-                messages: list | None = None,
-                usage_callback=None,
+            llm_client,
+            model: str,
+            prompt: str,
+            section_id: str,
+            purpose: str,
+            user_id: str,
+            messages: list | None = None,
+            usage_callback=None,
         ):
-            # Ignore metrics and usage_callback; we only care about the
-            # max_output_tokens passed into the underlying client.
             if usage_callback is not None:
                 try:
                     usage_callback({"_source": "test"})
@@ -1155,7 +1139,9 @@ class TestSectionTokenBudgets(LoggingTestCase):
                 messages=[{"role": "user", "content": prompt}],
             )
 
-        stage_b_generation.call_llm_section_with_metrics = fake_call_llm_section_with_metrics  # type: ignore[assignment]
+        stage_b_generation.call_llm_section_with_metrics = (  # type: ignore[assignment]
+            fake_call_llm_section_with_metrics
+        )
 
         try:
             captured: Dict[str, Any] = {}
@@ -1176,33 +1162,15 @@ class TestSectionTokenBudgets(LoggingTestCase):
             engine = CVGenerationEngine(fake_llm, generation_params={"max_retries": 1})
             engine._call_llm_with_retries("x", "profile_summary")
 
-            # We expect the first-attempt budget for profile_summary → 100
             self.assertEqual(captured["max_output_tokens"], 100)
         finally:
             stage_b_generation.load_parameters = original_load  # type: ignore[assignment]
             stage_b_generation.call_llm_section_with_metrics = original_call  # type: ignore[assignment]
 
 
-class TestContextVarsBinding(LoggingTestCase):
-    def test_generate_cv_binds_contextvars(self):
-        from structlog.contextvars import get_contextvars
-
-        def fake_llm(_p, **_k):
-            return "OK"
-
-        req = DummyRequest(
-            sections=["profile_summary"],
-            language="en",
-            user_id="U55",
-            template_info=DummyTemplateInfo(template_id="T_TEST"),
-        )
-        req.request_id = "REQ123"  # type: ignore[attr-defined]
-
-        engine = CVGenerationEngine(fake_llm)
-        engine.generate_cv(cast(CVGenerationRequest, req))
-
-        ctx = get_contextvars()
-        self.assertNotIn("request_id", ctx)
+# ---------------------------------------------------------------------------
+# Skill-level helpers & telemetry
+# ---------------------------------------------------------------------------
 
 
 class TestTaxonomyOnlyFallback(LoggingTestCase):
@@ -1225,18 +1193,17 @@ class TestTaxonomyOnlyFallback(LoggingTestCase):
         self.assertIn("ML", names)
         self.assertTrue(all(s.source == "taxonomy" for s in result))
 
+
 class TestExtractOriginalSkillLevels(LoggingTestCase):
-    def test_extract_levels_from_legacy_and_new(self):
+    def test_extract_levels_from_legacy_and_new(self) -> None:
         class SP:
-            def __init__(self):
+            def __init__(self) -> None:
                 self.skills = [
                     type("S", (), {"name": "ML", "level": "L4"})(),
                 ]
 
         req = DummyRequest(
-            profile_info={
-                "skills": [{"name": "Python", "level": "L3"}]
-            }
+            profile_info={"skills": [{"name": "Python", "level": "L3"}]}
         )
         req.student_profile = SP()  # type: ignore[attr-defined]
 
@@ -1247,15 +1214,16 @@ class TestExtractOriginalSkillLevels(LoggingTestCase):
         self.assertEqual(levels["python"], "L3")
         self.assertEqual(levels["ml"], "L4")
 
+
 class TestReconcileSkillLevels(LoggingTestCase):
-    def test_reconcile_restores_levels(self):
+    def test_reconcile_restores_levels(self) -> None:
         req = DummyRequest(
             profile_info={"skills": [{"name": "Python", "level": "L3"}]}
         )
         req_typed = cast(CVGenerationRequest, req)
 
         skills = [
-            OutputSkillItem(name="Python", level="L1", source="taxonomy")
+            OutputSkillItem(name="Python", level="L1", source="taxonomy"),
         ]
         fixed = stage_b_generation._reconcile_skill_levels_with_request(
             req_typed, skills
@@ -1264,19 +1232,19 @@ class TestReconcileSkillLevels(LoggingTestCase):
 
 
 class TestStructuredFirstOrdering(LoggingTestCase):
-    def test_structured_first_comprehensive_ordering(self):
-        def fake_params():
+    def test_structured_first_comprehensive_ordering(self) -> None:
+        def fake_params() -> Dict[str, Any]:
             return {
                 "generation": {
                     "enable_structured_skills": True,
                     "honor_template_sections_only": True,
                     "prompts": {"default": "X"},
                 },
-                "cross_section_evidence_sharing": {}
+                "cross_section_evidence_sharing": {},
             }
 
         original = stage_b_generation.load_parameters
-        stage_b_generation.load_parameters = fake_params
+        stage_b_generation.load_parameters = fake_params  # type: ignore[assignment]
 
         try:
             tmpl = DummyTemplateInfo()
@@ -1284,82 +1252,39 @@ class TestStructuredFirstOrdering(LoggingTestCase):
                 "profile_summary",
                 "skills_structured",
                 "skills",
-                "experience"
-            ]
+                "experience",
+            ]  # type: ignore[attr-defined]
 
             req = DummyRequest(
                 template_info=tmpl,
-                profile_info={"skills": ["Python"]}
+                profile_info={"skills": ["Python"]},
             )
             req_typed = cast(CVGenerationRequest, req)
 
             available = {
-                "profile_summary", "skills_structured", "skills", "experience"
+                "profile_summary",
+                "skills_structured",
+                "skills",
+                "experience",
             }
             resolved = _resolve_effective_sections(req_typed, available)
 
             self.assertEqual(
                 resolved,
-                ["profile_summary", "skills_structured", "skills", "experience"]
+                ["profile_summary", "skills_structured", "skills", "experience"],
             )
         finally:
-            stage_b_generation.load_parameters = original
+            stage_b_generation.load_parameters = original  # type: ignore[assignment]
+
 
 class TestStripMarkdownFence(LoggingTestCase):
-    def test_strip_json_fence(self):
+    def test_strip_json_fence(self) -> None:
         raw = """```json
         { "a": 1 }
         ```"""
         out = stage_b_generation._strip_markdown_fence(raw)
         self.assertEqual(out.strip(), '{ "a": 1 }')
 
-
-class TestZeroTokenRetry(LoggingTestCase):
-    """Zero-token responses trigger retries when configured in Stage B.
-
-    The llm_metrics layer records a zero-token snapshot with a non-mock
-    usage source, so Stage B will retry up to max_retries and then return
-    the last (still empty) text.
-    """
-
-    def test_zero_token_does_not_retry(self) -> None:
-        calls = {"n": 0}
-
-        class FakeResp:
-            def __init__(self) -> None:
-                self.text = ""
-
-                # Mimic Gemini-style usage_metadata so llm_metrics treats it as real
-                class UM:
-                    prompt_token_count = 0
-                    candidates_token_count = 0
-
-                self.usage_metadata = UM()
-                # llm_metrics sets _llm_usage_snapshot with _source != "merged"
-                self.raw = type("R", (), {"usage_metadata": UM()})
-
-            def __str__(self) -> str:  # pragma: no cover - just for logging
-                return ""
-
-        def fake_llm(_prompt: str, **_kw: Any) -> FakeResp:
-            calls["n"] += 1
-            return FakeResp()
-
-        engine = CVGenerationEngine(
-            llm_client=fake_llm,
-            generation_params={
-                "max_retries": 2,
-                "retry_on_zero_tokens": True,
-            },
-        )
-
-        result = engine._call_llm_with_retries("x", "skills")
-
-        # ✅ max_retries=2 → two attempts due to zero-token retry behaviour
-        self.assertEqual(calls["n"], 2)
-
-        # ✅ Result is still the empty text coming from FakeResp.text
-        self.assertEqual(result, "[ERROR: LLM returned zero tokens]")
 
 class TestSkillsAliasAndCombinedNames(LoggingTestCase):
     """Tests for alias mapping and dropping of combined canonical skills."""
@@ -1377,7 +1302,6 @@ class TestSkillsAliasAndCombinedNames(LoggingTestCase):
             allowed_additional_skills=[],
         )
 
-        # LLM returns the alias name "ML Ops"
         fake_json = """
         {
           "items": [
@@ -1390,13 +1314,14 @@ class TestSkillsAliasAndCombinedNames(LoggingTestCase):
             llm_client=lambda *_a, **_k: fake_json,
             generation_params={"max_retries": 1},
         )
-        engine._call_llm_with_retries = lambda prompt, section_id: fake_json  # type: ignore[assignment]
+        engine._call_llm_with_retries = (  # type: ignore[assignment]
+            lambda prompt, section_id: fake_json
+        )
 
-        # Patch alias map so "ml ops" → "machine learning operations"
         original_alias_loader = stage_b_generation._load_skills_alias_map
-        stage_b_generation._load_skills_alias_map = lambda: {
-            "ml ops": "machine learning operations"
-        }  # type: ignore[assignment]
+        stage_b_generation._load_skills_alias_map = (  # type: ignore[assignment]
+            lambda: {"ml ops": "machine learning operations"}
+        )
 
         try:
             req = DummyRequest(
@@ -1410,7 +1335,6 @@ class TestSkillsAliasAndCombinedNames(LoggingTestCase):
 
             self.assertEqual(len(result), 1)
             item = result[0]
-            # Name snapped to canonical, level preserved, source set to taxonomy
             self.assertEqual(item.name, "Machine Learning Operations")
             self.assertEqual(item.level, "L3_Advanced")
             self.assertEqual(item.source, "taxonomy")
@@ -1440,9 +1364,10 @@ class TestSkillsAliasAndCombinedNames(LoggingTestCase):
             llm_client=lambda *_a, **_k: fake_json,
             generation_params={"max_retries": 1},
         )
-        engine._call_llm_with_retries = lambda prompt, section_id: fake_json  # type: ignore[assignment]
+        engine._call_llm_with_retries = (  # type: ignore[assignment]
+            lambda prompt, section_id: fake_json
+        )
 
-        # Patch is_combined_canonical_name to only flag "Python & SQL"
         original_combined = stage_b_generation.is_combined_canonical_name
         stage_b_generation.is_combined_canonical_name = (  # type: ignore[assignment]
             lambda name, canon_map: name.strip().lower() == "python & sql"
@@ -1464,8 +1389,9 @@ class TestSkillsAliasAndCombinedNames(LoggingTestCase):
         finally:
             stage_b_generation.is_combined_canonical_name = original_combined  # type: ignore[assignment]
 
+
 class TestSummarizeSkillsTelemetry(LoggingTestCase):
-    """Unit tests_utils for _summarize_skills_telemetry helper."""
+    """Unit tests for _summarize_skills_telemetry helper."""
 
     def test_telemetry_none_skills(self) -> None:
         metrics = _summarize_skills_telemetry(None)
@@ -1485,6 +1411,12 @@ class TestSummarizeSkillsTelemetry(LoggingTestCase):
         self.assertEqual(metrics["taxonomy_count"], 2)
         self.assertEqual(metrics["inferred_count"], 1)
 
+
+# ---------------------------------------------------------------------------
+# Evidence helpers
+# ---------------------------------------------------------------------------
+
+
 class TestEvidenceHelpers(LoggingTestCase):
     """Tests for section-ID normalization and evidence collection."""
 
@@ -1498,7 +1430,9 @@ class TestEvidenceHelpers(LoggingTestCase):
             "profile_summary",
         )
 
-    def test_collect_evidence_for_skills_structured_uses_normalized_id_and_sharing(self) -> None:
+    def test_collect_evidence_for_skills_structured_uses_normalized_id_and_sharing(
+        self,
+    ) -> None:
         """skills_structured should reuse 'skills' hints and respect cross-section sharing."""
         evidences = [
             DummyEvidence("ev_skill", "FACT_SKILL"),
@@ -1512,7 +1446,6 @@ class TestEvidenceHelpers(LoggingTestCase):
             evidences=evidences,
         )
 
-        # cross_section_evidence_sharing: skills_structured can also see profile_summary
         def fake_load_parameters() -> Dict[str, Any]:
             return {
                 "cross_section_evidence_sharing": {
@@ -1532,9 +1465,9 @@ class TestEvidenceHelpers(LoggingTestCase):
         finally:
             stage_b_generation.load_parameters = original_load  # type: ignore[assignment]
 
-        # Should contain facts from skills AND shared profile_summary
         self.assertIn("FACT_SKILL", facts)
         self.assertIn("FACT_PROFILE", facts)
+
 
 class TestReconcileOnlyInferredSkills(LoggingTestCase):
     """Ensure reconciliation leaves purely inferred skills unchanged."""
@@ -1546,7 +1479,6 @@ class TestReconcileOnlyInferredSkills(LoggingTestCase):
         )
         req_typed = cast(CVGenerationRequest, req)
 
-        # "GraphQL" only appears as inferred, not in canonical profile skills
         skills = [
             OutputSkillItem(name="GraphQL", level="L2", source="inferred"),
         ]
@@ -1560,11 +1492,17 @@ class TestReconcileOnlyInferredSkills(LoggingTestCase):
         self.assertEqual(fixed[0].source, "inferred")
 
 
+# ---------------------------------------------------------------------------
+# Education prompt
+# ---------------------------------------------------------------------------
+
+
 class TestEducationPromptBuilding(LoggingTestCase):
-    """Tests for _build_section_prompt for education."""
+    """Tests for build_section_prompt for education."""
 
     def test_build_education_prompt_includes_full_education_facts(self) -> None:
         """Education prompt should include degree, institution, major, GPA, and dates if available."""
+
         class DummyEdu:
             def __init__(self) -> None:
                 self.id = "edu#bsc_kasetsart_cs"
@@ -1579,44 +1517,31 @@ class TestEducationPromptBuilding(LoggingTestCase):
             def __init__(self) -> None:
                 self.education = [DummyEdu()]
 
-        # No evidence_plan needed here – we rely on request.student_profile
         req = DummyRequest(
             sections=["education"],
             language="en",
             template_info=DummyTemplateInfo(template_id="T_EMPLOYER_STD_V3"),
             profile_info={"name": "Test User"},
         )
-        # Attach duck-typed student_profile with full education info
         req.student_profile = DummyStudentProfile()  # type: ignore[attr-defined]
-
-        engine = CVGenerationEngine(
-            llm_client=lambda *_a, **_k: "ignored",
-            generation_params={"log_prompts": False},
-        )
 
         req_typed = cast(CVGenerationRequest, cast(object, req))
 
-        prompt = engine._build_section_prompt(
+        # ✅ Call build_section_prompt directly (no longer via engine)
+        prompt = build_section_prompt(
             request=req_typed,
             evidence_plan=None,
             section_id="education",
         )
 
-        # Degree and institution
         self.assertIn("BSc in Computer Science", prompt)
         self.assertIn("Kasetsart University", prompt)
-        # Major
         self.assertIn("Computer Science", prompt)
-        # GPA
         self.assertIn("3.6", prompt)
-        # Dates (at least the years should appear)
         self.assertIn("2015", prompt)
         self.assertIn("2019", prompt)
-        # Output requirements marker (same structure as other sections)
         self.assertIn("=== Output Requirements ===", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
-
-
-

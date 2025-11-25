@@ -124,7 +124,19 @@ def _safe_get_text(resp, prompt=None):
 # ---------------------------------------------------------------------------
 @lru_cache(maxsize=1)
 def _project_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    """
+    Return the actual project root directory.
+
+    This walks up parent directories until one containing the
+    top-level 'parameters' folder is found.
+    """
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "parameters").exists():
+            return parent
+    # fallback – assume repo root is three levels up
+    return here.parents[2]
+
 
 @lru_cache(maxsize=1)
 def _load_credentials() -> Dict[str, Any]:

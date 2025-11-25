@@ -9,6 +9,10 @@ import structlog
 
 from schemas.output_schema import CVGenerationResponse, SectionContent, OutputSkillItem
 from functions.utils.llm_client import load_parameters
+from functions.utils.claims import (
+    build_empty_justification,
+    validate_justification_against_text,
+)
 
 logger = structlog.get_logger(__name__).bind(module="stage_c_validation")
 
@@ -200,7 +204,95 @@ def run_stage_c_validation(
         original_request=original_request,
     )
 
-    # 7) Strict mode: if we ended with no sections at all, consider this fatal
+    # 7) Ensure justification object is present and sane
+    try:
+        from schemas.output_schema import Justification
+        from functions.utils.claims import (
+            migrate_legacy_justification_schema,
+            should_require_justification,
+        )
+
+        # Load generation config so we can see which sections actually require justification
+        params_full = load_parameters() or {}
+        generation_cfg = params_full.get("generation") or {}
+
+        justification = getattr(resp, "justification", None)
+        if justification is None:
+            justification = build_empty_justification()
+
+        # Detect "empty" justification → candidate for reconstruction
+        is_empty = (
+            len(getattr(justification, "evidence_map", []) or []) == 0
+            and len(getattr(justification, "unsupported_claims", []) or []) == 0
+            and getattr(justification, "total_claims_analyzed", 0) == 0
+        )
+
+        # Use all sections' text for final coverage validation
+        all_section_text = "\n\n".join(
+            (sec.text or "") for sec in (resp.sections or {}).values()
+        )
+
+        # ------------------------------------------------------------------
+        # Legacy → new schema migration (ONLY if Stage B gave us nothing)
+        # ------------------------------------------------------------------
+        if is_empty:
+            legacy_union: dict[str, Any] = {
+                "evidence_map": [],
+                "unsupported_claims": [],
+            }
+
+            # Reconstruct per-section, but ONLY for sections that require justification.
+            for section_id, sec in (resp.sections or {}).items():
+                if not should_require_justification(section_id, generation_cfg):
+                    continue
+
+                sec_text = (sec.text or "").strip()
+                if not sec_text:
+                    continue
+
+                # Build a simple legacy-style dict for THIS section only
+                legacy_base = {
+                    "evidence_map": [
+                        {
+                            "claim": sent.strip(),
+                            "source": "profile_info",
+                        }
+                        for sent in re.split(r"[.!?]\s+", sec_text)
+                        if sent.strip()
+                    ],
+                    "unsupported_claims": [],
+                }
+
+                # IMPORTANT: use the REAL section_id here (experience, skills, etc.)
+                migrated = migrate_legacy_justification_schema(
+                    legacy_base,
+                    section_id=section_id,
+                    section_text=sec_text,
+                )
+
+                # Accumulate into a single union dict
+                for ev in migrated.get("evidence_map") or []:
+                    legacy_union["evidence_map"].append(ev)
+
+            # If we built anything, validate it; otherwise keep an empty justification
+            if legacy_union["evidence_map"]:
+                justification = Justification.model_validate(legacy_union)
+            else:
+                justification = build_empty_justification()
+
+        # ---------------------------------------------------------------
+        # Now run the real validation (filters and coverage computation)
+        # ---------------------------------------------------------------
+        justification = validate_justification_against_text(
+            justification,
+            all_section_text,
+        )
+        resp.justification = justification
+
+    except Exception as exc:
+        logger.warning("stage_c_justification_failed", error=str(exc))
+
+    # 8) Strict mode: if we ended with no sections at all, consider this fatal
     if strict_mode and not resp.sections:
         msg = "Stage C removed all sections; failing in strict_mode."
         logger.error("stage_c_all_sections_removed_strict", message=msg)
