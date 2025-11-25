@@ -768,34 +768,28 @@ def adjust_section_token_budget(
         base_budget: int | None,
         generation_cfg: Dict[str, Any] | None,
 ) -> int | None:
-    """
-    Adjust the token budget when justification is enabled.
-
-    Handles section_id normalization (e.g., skills_structured → skills)
-    to match the sections_req_justification config.
-    """
     if base_budget is None:
         return None
 
     if not generation_cfg:
         return base_budget
 
-    # 🔹 NEW: Normalize section_id to canonical form
-    # This ensures "skills_structured" is treated as "skills"
+    # 🔹 Normalize helper section IDs to their base section
     canonical_section_id = section_id
-    if section_id.endswith("_structured"):
-        canonical_section_id = section_id[:-len("_structured")]
+    suffixes = ("_structured", "_justification", "_augment", "_bullets")
+    for suf in suffixes:
+        if section_id.endswith(suf):
+            canonical_section_id = section_id[:-len(suf)]
+            break
 
-    # Try both the exact section_id AND the canonical form
     needs_justification = (
-            should_require_justification(section_id, generation_cfg)
-            or should_require_justification(canonical_section_id, generation_cfg)
+        should_require_justification(section_id, generation_cfg)
+        or should_require_justification(canonical_section_id, generation_cfg)
     )
 
     if not needs_justification:
         return base_budget
 
-    # Additional justification token allowance
     extra = generation_cfg.get("justification_additional_tokens")
     try:
         extra = int(extra)
@@ -806,3 +800,4 @@ def adjust_section_token_budget(
         return base_budget
 
     return int(base_budget) + extra
+
