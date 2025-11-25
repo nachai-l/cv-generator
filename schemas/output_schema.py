@@ -268,6 +268,47 @@ class QualityMetrics(BaseModel):
 
     model_config = {"extra": "forbid"}
 
+class QualityMetrics(BaseModel):
+    """Quality assessment metrics for generated CV."""
+
+    clarity_score: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=100.0,
+        description="Readability / clarity score (0-100)",
+    )
+    jd_alignment_score: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=100.0,
+        description="Alignment with job description (0-100)",
+    )
+    completeness_score: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=100.0,
+        description="How complete the CV is (0-100)",
+    )
+    consistency_score: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=100.0,
+        description="Internal consistency (0-100)",
+    )
+    overall_score: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=100.0,
+        description="Overall quality score (0-100)",
+    )
+
+    feedback: list[str] = Field(
+        default_factory=list,
+        description="List of feedback items describing strengths or issues",
+    )
+
+    model_config = {"extra": "forbid"}
+
 
 class ValidationWarning(BaseModel):
     """Warning about potential issues in generated content."""

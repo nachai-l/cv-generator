@@ -1,16 +1,15 @@
-# tests_utils/test_stage_d_packaging.py
-
 """
 Unit tests_utils for Stage D – Response Packaging & Delivery.
 
 Covers:
 - finalize_cv_response(): enrichment of metadata, request_id generation,
-  LLM usage aggregation, and basic consistency adjustments.
+  LLM usage aggregation, quality metrics computation, and basic consistency
+  adjustments.
 - build_error_response(): standardized ErrorResponse construction and
   HTTP status propagation.
 
 Stage D MUST NOT mutate sections or skills content; it only enriches
-metadata and logs.
+metadata, quality metrics, and logs.
 """
 
 from __future__ import annotations
@@ -45,6 +44,7 @@ def _build_minimal_cv_response(
     language: str = "en",
     status: GenerationStatus = GenerationStatus.COMPLETED,
     sections: Dict[str, SectionContent] | None = None,
+    quality_metrics: QualityMetrics | None = None,
 ) -> CVGenerationResponse:
     """
     Helper to construct a minimal-but-valid CVGenerationResponse
@@ -92,14 +92,11 @@ def _build_minimal_cv_response(
         profile_info=None,
     )
 
-    quality_metrics = QualityMetrics(
-        clarity_score=80.0,
-        jd_alignment_score=75.0,
-        completeness_score=70.0,
-        consistency_score=85.0,
-        overall_score=78.0,
-        feedback=["Looks good overall."],
-    )
+    # If caller explicitly passed quality_metrics=None, keep it None
+    if quality_metrics is None:
+        qm = None
+    else:
+        qm = quality_metrics
 
     return CVGenerationResponse(
         job_id=job_id,
@@ -112,7 +109,7 @@ def _build_minimal_cv_response(
         ],
         metadata=metadata,
         justification=justification,
-        quality_metrics=quality_metrics,
+        quality_metrics=qm,
         warnings=[],
         error=None,
         error_details=None,
@@ -369,6 +366,48 @@ class TestStageDPackaging(unittest.TestCase):
         orig_tuples = [(s.name, s.level, s.source) for s in original_skills]
         fin_tuples = [(s.name, s.level, s.source) for s in (finalized.skills or [])]
         self.assertEqual(orig_tuples, fin_tuples)
+
+    def test_finalize_cv_response_computes_quality_metrics_and_warnings(self) -> None:
+        """
+        finalize_cv_response() should compute QualityMetrics when missing
+        and convert feedback items into ValidationWarning entries with
+        section='quality_metrics' and warning_type='quality_feedback'.
+        """
+        # Start with a CV that has NO quality_metrics and NO warnings
+        cv = _build_minimal_cv_response(quality_metrics=None)
+        self.assertIsNone(cv.quality_metrics)
+        self.assertEqual(len(cv.warnings), 0)
+
+        finalized, _ = finalize_cv_response(
+            cv,
+            request_id="REQ_quality_metrics",
+            user_id="user-quality",
+            profile_info=None,
+            llm_usage=None,
+            generation_start=None,
+            generation_end=None,
+        )
+
+        # Quality metrics should now be populated
+        self.assertIsNotNone(finalized.quality_metrics)
+        self.assertIsInstance(finalized.quality_metrics, QualityMetrics)
+
+        # There should be zero or more feedback items; if there are any,
+        # they must be reflected as ValidationWarning entries.
+        feedback_items = finalized.quality_metrics.feedback
+        quality_warnings = [
+            w
+            for w in finalized.warnings
+            if w.section == "quality_metrics"
+            and w.warning_type == "quality_feedback"
+        ]
+
+        # Number of warnings should match feedback count
+        self.assertEqual(len(quality_warnings), len(feedback_items))
+        # Messages should match exactly
+        warning_messages = [w.message for w in quality_warnings]
+        for fb in feedback_items:
+            self.assertIn(fb, warning_messages)
 
 
 if __name__ == "__main__":

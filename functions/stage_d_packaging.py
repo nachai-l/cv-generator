@@ -28,6 +28,8 @@ from schemas.output_schema import (
     ErrorResponse,
     GenerationStatus,
 )
+from functions.utils.quality_metrics import compute_quality_metrics
+from schemas.output_schema import QualityMetrics, ValidationWarning
 
 logger = structlog.get_logger(__name__).bind(module="stage_d_packaging")
 
@@ -218,11 +220,36 @@ def finalize_cv_response(
         except Exception:
             pass
 
-        # Mark Stage D completion flag if the metadata model supports it.
+        meta.stage_d_completed = True
+
+        # -----------------------------------------------------------------------
+        # Compute Quality Metrics (Clarity, JD alignment, completeness, etc.)
+        # -----------------------------------------------------------------------
         try:
-            setattr(meta, "stage_d_completed", True)
-        except Exception:
-            pass
+            # The orchestrator or request may provide a list of JD-required skills.
+            # If absent, pass empty list – compute_quality_metrics handles it gracefully.
+            jd_required_skills = []
+
+            # cv.quality_metrics is optional; always compute a fresh one here.
+            qm: QualityMetrics = compute_quality_metrics(
+                cv,
+                jd_required_skills=jd_required_skills,
+            )
+            cv.quality_metrics = qm
+
+            # Convert quality-metrics feedback into ValidationWarning objects
+            for fb in qm.feedback:
+                cv.warnings.append(
+                    ValidationWarning(
+                        section="quality_metrics",
+                        warning_type="quality_feedback",
+                        message=fb,
+                        suggestion=None,
+                    )
+                )
+
+        except Exception as e:
+            logger.exception("stage_d_quality_metrics_failed", error=str(e))
 
     # Ensure status is set (default COMPLETED if missing/None)
     try:
