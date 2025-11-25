@@ -560,14 +560,6 @@ def _strip_markdown_fence(text: str) -> str:
         stripped = "\n".join(lines).strip()
     return stripped
 
-
-def _truncate_text(text: str, max_chars: int | None) -> str:
-    """Truncate text to max_chars and append '…' if needed."""
-    if max_chars is None or len(text) <= max_chars:
-        return text
-    return text[:max_chars].rstrip() + "…"
-
-
 def _get_section_char_limits(request: CVGenerationRequest) -> Dict[str, int]:
     """Extract per-section character limits from template_info."""
     tmpl = getattr(request, "template_info", None)
@@ -2241,11 +2233,8 @@ class CVGenerationEngine:
                             prompt,
                             section_id,
                         )
-                        truncated = _truncate_text(
-                            raw_text or "",
-                            char_limits.get("experience"),
-                        )
-                        text_for_section = truncated or ""
+
+                        text_for_section = raw_text
                         if len(text_for_section.strip()) < MIN_SECTION_LENGTH:
                             text_for_section = build_section_fallback_text(
                                 request,
@@ -2299,10 +2288,6 @@ class CVGenerationEngine:
 
                     # 4) Deterministic markdown rendering
                     section_text = render_experience_section_from_structured(items)
-                    section_text = _truncate_text(
-                        section_text,
-                        char_limits.get("experience"),
-                    )
 
                     if len((section_text or "").strip()) < MIN_SECTION_LENGTH:
                         section_text = build_section_fallback_text(
@@ -2375,10 +2360,6 @@ class CVGenerationEngine:
                 # ------------------------------------------------------------------
                 if section_id == "skills" and structured_first and skills_output is not None:
                     text_for_section = format_plain_skill_bullets(skills_output)
-                    text_for_section = _truncate_text(
-                        text_for_section or "",
-                        char_limits.get("skills"),
-                    )
 
                     if len(text_for_section.strip()) < MIN_SECTION_LENGTH:
                         logger.warning(
@@ -2454,12 +2435,8 @@ class CVGenerationEngine:
                             },
                         )
 
-                    truncated = _truncate_text(
-                        section_text_raw or "",
-                        char_limits.get(section_id),
-                    )
+                    text_for_section = section_text_raw
 
-                    text_for_section = truncated or ""
                     if len(text_for_section) < MIN_SECTION_LENGTH:
                         logger.warning(
                             "section_text_too_short",

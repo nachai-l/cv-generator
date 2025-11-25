@@ -13,6 +13,7 @@ from functions.utils.claims import (
     build_empty_justification,
     validate_justification_against_text,
 )
+from functions.utils.safe_truncate import smart_truncate_markdown
 
 logger = structlog.get_logger(__name__).bind(module="stage_c_validation")
 
@@ -68,8 +69,12 @@ def _load_validation_params() -> Dict[str, Any]:
     if isinstance(security_cfg, dict):
         cfg.setdefault("_security_cfg", security_cfg)
 
-    return cfg
+    # Attach truncation config (if present) for Stage C length control
+    trunc_cfg = params.get("truncation_config") or {}
+    if isinstance(trunc_cfg, dict):
+        cfg.setdefault("_truncation_cfg", trunc_cfg)
 
+    return cfg
 
 def _fallback_skills_from_request(original_request: Any) -> List[OutputSkillItem]:
     """
@@ -152,17 +157,15 @@ def run_stage_c_validation(
     Stage C: post-LLM validation & sanitization.
 
     - Enforces section set & order according to template_info
-    - Cleans each section's text (whitespace, length, simple artifacts)
-    - Performs light prompt-injection backstop using security patterns
+    - Cleans each section's text (whitespace, injection backstop, markdown artifacts)
+    - Validates justification against FULL (pre-truncation) section text
+    - Applies smart truncation AFTER justification (JSON-safe, markdown-aware)
     - Normalizes and deduplicates skills (aligned with Stage B canonical logic)
     - Runs global consistency checks:
         * name/email present (optional)
         * min skills / education thresholds
         * cross-checks vs original_request (template_id, job_id, language)
     - Optionally enforces strict_mode via StageCValidationError
-
-    Returns a CVGenerationResponse that should still dump to the same
-    JSON format as Stage B output (e.g. tests_utils/generated_test_cvs/output_w_llm.json).
     """
     cfg = _load_validation_params()
     strict_mode = bool(cfg.get("strict_mode", False))
@@ -178,9 +181,9 @@ def run_stage_c_validation(
     tmpl_dict = _normalize_template_info(resolved_template_info)
     allowed_sections = _compute_allowed_sections(tmpl_dict)
 
-    # 3) Sanitize sections (drop unknown, enforce order, truncate & clean text)
+    # 3a) CLEAN sections (injection, markdown cleanup, drop-empty) – NO truncation
     sections = getattr(resp, "sections", None) or {}
-    cleaned_sections = _sanitize_sections(
+    cleaned_sections = _clean_sections_no_truncate(
         sections=sections,
         allowed_sections=allowed_sections,
         template_info=tmpl_dict,
@@ -204,7 +207,7 @@ def run_stage_c_validation(
         original_request=original_request,
     )
 
-    # 7) Ensure justification object is present and sane
+    # 7) Ensure justification object is present, migrated, and VALIDATED
     try:
         from schemas.output_schema import Justification
         from functions.utils.claims import (
@@ -227,7 +230,7 @@ def run_stage_c_validation(
             and getattr(justification, "total_claims_analyzed", 0) == 0
         )
 
-        # Use all sections' text for final coverage validation
+        # Use FULL, pre-truncation section text for coverage validation
         all_section_text = "\n\n".join(
             (sec.text or "") for sec in (resp.sections or {}).values()
         )
@@ -263,25 +266,22 @@ def run_stage_c_validation(
                     "unsupported_claims": [],
                 }
 
-                # IMPORTANT: use the REAL section_id here (experience, skills, etc.)
                 migrated = migrate_legacy_justification_schema(
                     legacy_base,
                     section_id=section_id,
                     section_text=sec_text,
                 )
 
-                # Accumulate into a single union dict
                 for ev in migrated.get("evidence_map") or []:
                     legacy_union["evidence_map"].append(ev)
 
-            # If we built anything, validate it; otherwise keep an empty justification
             if legacy_union["evidence_map"]:
                 justification = Justification.model_validate(legacy_union)
             else:
                 justification = build_empty_justification()
 
         # ---------------------------------------------------------------
-        # Now run the real validation (filters and coverage computation)
+        # Real validation against FULL pre-truncation section text
         # ---------------------------------------------------------------
         justification = validate_justification_against_text(
             justification,
@@ -292,7 +292,15 @@ def run_stage_c_validation(
     except Exception as exc:
         logger.warning("stage_c_justification_failed", error=str(exc))
 
-    # 8) Strict mode: if we ended with no sections at all, consider this fatal
+    # 8) NOW apply smart truncation (JSON-safe, markdown-aware)
+    resp.sections = _truncate_sections_post_justification(
+        sections=resp.sections or {},
+        template_info=tmpl_dict,
+        cfg=cfg,
+        resp=resp,
+    )
+
+    # 9) Strict mode: if we ended with no sections at all, consider this fatal
     if strict_mode and not resp.sections:
         msg = "Stage C removed all sections; failing in strict_mode."
         logger.error("stage_c_all_sections_removed_strict", message=msg)
@@ -305,6 +313,7 @@ def run_stage_c_validation(
     )
 
     return resp
+
 
 
 # ---------------------------------------------------------------------------
@@ -550,8 +559,7 @@ def _clean_section_markdown(section_id: str, text: str) -> str:
 
     return text
 
-
-def _sanitize_sections(
+def _clean_sections_no_truncate(
     *,
     sections: Dict[str, Any],
     allowed_sections: List[str],
@@ -560,24 +568,18 @@ def _sanitize_sections(
     resp: CVGenerationResponse,
 ) -> Dict[str, SectionContent]:
     """
+    Clean sections WITHOUT applying any length truncation.
+
+    Responsibilities:
     - Keep only sections that are allowed by template_info (for ordering),
       but NEVER silently drop sections that Stage B already generated.
-    - Enforce deterministic ordering (template-first, then any extra sections)
-    - Run light injection backstop using security patterns
-    - Clean & truncate text according to template + validation config
-      (aligned with per-section limits already applied in Stage B)
+    - Enforce deterministic ordering (template-first, then any extra sections).
+    - Run injection backstop using security patterns and drop critical sections.
+    - Normalize markdown artifacts (headings, extra bullets).
+    - Basic text cleanup.
+    - Drop sections that are truly empty after cleaning (if configured).
     """
     cleaned: Dict[str, SectionContent] = {}
-
-    # Pre-compute per-section max length (from template_info, as in Stage B)
-    per_section_limits: Dict[str, int] = {}
-    tmpl_limits = template_info.get("max_chars_per_section") or {}
-    if isinstance(tmpl_limits, dict):
-        for k, v in tmpl_limits.items():
-            try:
-                per_section_limits[str(k)] = int(v)
-            except Exception:
-                continue
 
     default_max = int(cfg.get("max_section_chars_default", 1500))
     drop_empty = bool(cfg.get("drop_empty_sections", True))
@@ -592,13 +594,8 @@ def _sanitize_sections(
     suspicious_patterns = security_cfg.get("suspicious_patterns") or []
 
     # Decide which section IDs to process:
-    # - If allowed_sections is non-empty, use it for ordering but
-    #   also append any extra sections present in `sections`.
-    # - If allowed_sections is empty, just use the keys from `sections`.
     if allowed_sections:
         section_ids: List[str] = [sid for sid in allowed_sections if sid in sections]
-        # Append any Stage B–generated sections not listed in the template,
-        # so we never drop them silently.
         for sid in sections.keys():
             if sid not in section_ids:
                 section_ids.append(sid)
@@ -644,22 +641,19 @@ def _sanitize_sections(
         # Basic cleaning
         text = _clean_text(text, enable_cleaning)
 
-        # Strip redundant headings like 'Publications', 'Training',
         # Section-specific cleanup: drop bullets that are just headings
         if section_id in ("training", "publications"):
             lines = text.splitlines()
             cleaned_lines: list[str] = []
             for line in lines:
                 stripped = line.strip()
-                # remove leading bullet symbols for the check
                 core = stripped.lstrip("-•").strip().lower()
                 if core in {
                     "training",
                     "publications",
-                    "ผลงานตีพิมพ์",   # Thai: publications
-                    "การฝึกอบรม",     # Thai: training
+                    "ผลงานตีพิมพ์",
+                    "การฝึกอบรม",
                 }:
-                    # skip pure-heading bullet
                     continue
                 cleaned_lines.append(line)
             text = "\n".join(cleaned_lines).strip()
@@ -674,27 +668,8 @@ def _sanitize_sections(
             logger.info("stage_c_section_dropped_empty", section_id=section_id)
             continue
 
-        # Length limit (aligned with Stage B per-section character limits)
-        max_len = per_section_limits.get(section_id, default_max)
-        if max_len > 0 and len(text) > max_len:
-            truncated_text = text[:max_len].rstrip()
-            _append_metadata_warning(
-                resp,
-                f"Section '{section_id}' truncated from {len(text)} to {len(truncated_text)} characters.",
-            )
-            logger.info(
-                "stage_c_section_truncated",
-                section_id=section_id,
-                old_len=len(text),
-                new_len=len(truncated_text),
-                max_len=max_len,
-            )
-            text = truncated_text
-
         if text != orig_text:
-            # Update section object
             sec_obj.text = text
-            # Best-effort: refresh word_count if the field exists
             if hasattr(sec_obj, "word_count"):
                 try:
                     sec_obj.word_count = len(text.split())
@@ -705,6 +680,121 @@ def _sanitize_sections(
 
     return cleaned
 
+def _truncate_sections_post_justification(
+    *,
+    sections: Dict[str, SectionContent],
+    template_info: Dict[str, Any],
+    cfg: Dict[str, Any],
+    resp: CVGenerationResponse,
+) -> Dict[str, SectionContent]:
+    """
+    Apply smart, JSON-safe truncation AFTER justification has been validated.
+
+    - Respects per-section max_chars_per_section from template_info.
+    - Uses smart_truncate_markdown (sentence-aware, markdown-aware, JSON-protected).
+    - Logs truncation and attaches warnings when truncation is applied.
+    - If truncation is disabled in truncation_config, falls back to naive cut.
+    """
+    if not sections:
+        return sections
+
+    # Per-section max limits as in Stage B
+    per_section_limits: Dict[str, int] = {}
+    tmpl_limits = template_info.get("max_chars_per_section") or {}
+    if isinstance(tmpl_limits, dict):
+        for k, v in tmpl_limits.items():
+            try:
+                per_section_limits[str(k)] = int(v)
+            except Exception:
+                continue
+
+    default_max = int(cfg.get("max_section_chars_default", 1500))
+
+    # Truncation config
+    trunc_cfg = cfg.get("_truncation_cfg") or {}
+    if not isinstance(trunc_cfg, dict):
+        trunc_cfg = {}
+    truncation_enable = bool(trunc_cfg.get("truncation_enable", True))
+    overflow_limit = int(trunc_cfg.get("overflow_limit", 64))
+    reduction_limit = float(trunc_cfg.get("reduction_limit", 0.15))
+
+    # Language hint for sentence boundaries
+    lang_norm = _normalize_language(getattr(resp, "language", None)) or "en"
+    lang_short: str = "th" if lang_norm.startswith("th") else "en"
+
+    out: Dict[str, SectionContent] = {}
+
+    for section_id, sec_obj in sections.items():
+        text = getattr(sec_obj, "text", "")
+        if not isinstance(text, str):
+            text = str(text)
+
+        original_text = text
+        max_len = per_section_limits.get(section_id, default_max)
+
+        if max_len > 0 and len(text) > max_len:
+            if truncation_enable:
+                trunc_result = smart_truncate_markdown(
+                    text=text,
+                    max_len=max_len,
+                    lang=lang_short,  # type: ignore[arg-type]
+                    overflow_limit=overflow_limit,
+                    reduction_limit=reduction_limit,
+                    section_id=section_id,
+                )
+
+                truncated_text = trunc_result.get("safe_text", text)
+                trunc_applied = bool(trunc_result.get("truncation_applied", False))
+                strategy_used = trunc_result.get("strategy_used", "none")
+
+                # Only log when real truncation happened (JSON path will return trunc_applied=False)
+                if trunc_applied and truncated_text != text:
+                    _append_metadata_warning(
+                        resp,
+                        (
+                            f"Section '{section_id}' truncated from "
+                            f"{len(text)} to {len(truncated_text)} characters "
+                            f"(strategy={strategy_used})."
+                        ),
+                    )
+                    logger.info(
+                        "stage_c_section_truncated",
+                        section_id=section_id,
+                        old_len=len(text),
+                        new_len=len(truncated_text),
+                        max_len=max_len,
+                        strategy=strategy_used,
+                    )
+
+                text = truncated_text
+            else:
+                # Legacy naive truncation
+                truncated_text = text[:max_len].rstrip()
+                _append_metadata_warning(
+                    resp,
+                    f"Section '{section_id}' truncated from {len(text)} to {len(truncated_text)} characters (strategy=naive).",
+                )
+                logger.info(
+                    "stage_c_section_truncated",
+                    section_id=section_id,
+                    old_len=len(text),
+                    new_len=len(truncated_text),
+                    max_len=max_len,
+                    strategy="naive",
+                )
+                text = truncated_text
+
+        if text != original_text:
+            sec_obj.text = text
+            if hasattr(sec_obj, "word_count"):
+                try:
+                    sec_obj.word_count = len(text.split())
+                except Exception:
+                    pass
+
+        out[section_id] = sec_obj
+
+    return out
 
 _SECTION_MULTI_BLANK_RE = re.compile(r"\n{3,}")
 def _strip_leading_section_heading(section_id: str, text: str) -> str:

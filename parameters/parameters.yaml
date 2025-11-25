@@ -1,3 +1,4 @@
+# parameters/parameters.yaml
 # =============================================================================
 # CV Generation Service - Parameters Configuration
 #
@@ -116,6 +117,7 @@ section_token_budgets:
   skills_structured: [4096, 6144, 10240]   # High budget for structured skills; monitor cost/latency
   experience: [4096, 10240, 12396]
   experience_bullets: [4096, 10240, 12396]
+  experience_justification: [4096, 10240, 12396]
   education: [2048, 4096, 8192]
 
 # -----------------------------------------------------------------------------
@@ -163,6 +165,14 @@ security:
 
   # Any non-whitespace control characters are stripped or flagged.
   control_chars_except_whitespace: "[\\x00-\\x08\\x0B-\\x0C\\x0E-\\x1F\\x7F]"
+
+# -----------------------------------------------------------------------------
+# Truncation configuration
+# -----------------------------------------------------------------------------
+truncation_config:
+  truncation_enable: true
+  overflow_limit: 64         # Max extra chars allowed beyond max_len
+  reduction_limit: 0.15      # Max 15% removal allowed before fallback
 
 # -----------------------------------------------------------------------------
 # Validation configuration

@@ -177,8 +177,59 @@ class TestSectionValidation(LoggingTestCase):
                 "enable_safety_cleaning": True,
                 "max_skills": 10,
                 # leave other keys defaulted by _load_validation_params
-            }
+            },
+            "truncation_config": {
+                "truncation_enable": True,
+                "overflow_limit": 64,
+                "reduction_limit": 0.15,
+            },
         }
+    def test_json_section_never_truncated_even_if_over_limit(self) -> None:
+        """
+        JSON-like sections (e.g., skills_structured) must NEVER be truncated,
+        even when their length exceeds the per-section max_chars_per_section.
+        This relies on smart_truncate_markdown's JSON fast-path.
+        """
+        meta = DummyMeta()
+
+        json_text = '{"skills": [{"name": "Python", "level": "Advanced"}, {"name": "SQL", "level": "Intermediate"}]}'
+        self.assertGreater(len(json_text), 20)  # sanity check
+
+        resp = CVGenerationResponse.model_construct(
+            template_id="T_TEST",
+            job_id="JOB1",
+            language="en",
+            sections={
+                "skills_structured": SectionContent.model_construct(text=json_text),
+            },
+            metadata=meta,
+            skills=None,
+        )
+
+        template_info = {
+            "sections_order": ["skills_structured"],
+            "max_chars_per_section": {
+                # Intentionally tiny limit to force truncation *if* JSON were not protected
+                "skills_structured": 20,
+            },
+        }
+
+        with patch("functions.stage_c_validation.load_parameters", lambda: self._fake_validation_cfg()):
+            validated = run_stage_c_validation(
+                resp,
+                template_info=template_info,
+                original_request=None,
+            )
+
+        out_text = validated.sections["skills_structured"].text
+
+        # JSON should be returned EXACTLY as-is (no truncation)
+        self.assertEqual(out_text, json_text)
+        # And there should be no truncation warning mentioning this section
+        self.assertFalse(
+            any("skills_structured" in msg and "truncated" in msg for msg in meta.validation_warnings),
+            msg=f"JSON section should not be truncated, warnings: {meta.validation_warnings}",
+        )
 
     def test_template_order_respected_and_extra_sections_kept(self) -> None:
         """
@@ -301,7 +352,12 @@ class TestSkillsValidation(LoggingTestCase):
                 "drop_empty_sections": True,
                 "enable_safety_cleaning": True,
                 "max_skills": 2,  # small cap for testing
-            }
+            },
+            "truncation_config": {
+                "truncation_enable": True,
+                "overflow_limit": 64,
+                "reduction_limit": 0.15,
+            },
         }
 
     def test_skills_normalized_deduplicated_and_capped(self) -> None:
@@ -419,7 +475,12 @@ class TestMetadataBehaviour(LoggingTestCase):
                 "drop_empty_sections": True,
                 "enable_safety_cleaning": True,
                 "max_skills": 10,
-            }
+            },
+            "truncation_config": {
+                "truncation_enable": True,
+                "overflow_limit": 64,
+                "reduction_limit": 0.15,
+            },
         }
 
     def test_metadata_stage_c_validated_flag_set(self) -> None:
@@ -637,7 +698,12 @@ class TestCrossChecksAgainstRequest(LoggingTestCase):
                 "enable_safety_cleaning": True,
                 "max_skills": 10,
                 "strict_mode": False,
-            }
+            },
+            "truncation_config": {
+                "truncation_enable": True,
+                "overflow_limit": 64,
+                "reduction_limit": 0.15,
+            },
         }
 
     def test_template_id_mismatch_adds_warning_non_strict(self) -> None:
@@ -939,7 +1005,12 @@ class TestNewRequestShapeIntegration(LoggingTestCase):
                 "enable_safety_cleaning": True,
                 "max_skills": 10,
                 "strict_mode": False,
-            }
+            },
+            "truncation_config": {
+                "truncation_enable": True,
+                "overflow_limit": 64,
+                "reduction_limit": 0.15,
+            },
         }
 
     def test_sections_resolved_from_new_request_shape(self) -> None:
@@ -983,6 +1054,85 @@ class TestNewRequestShapeIntegration(LoggingTestCase):
         # template_id should be filled from the new-shape request
         self.assertEqual(validated.template_id, "T_NEW_REQ")
 
+class TestJustificationOrder(LoggingTestCase):
+    """
+    Ensure justification validation runs on FULL pre-truncation text,
+    while the final section text may be truncated.
+    """
+
+    def test_justification_uses_full_pre_truncation_text(self) -> None:
+        meta = DummyMeta()
+
+        # Make text clearly longer than the template limit
+        long_text = "This is a long profile summary sentence that should exceed the limit."
+        self.assertGreater(len(long_text), 20)  # sanity check
+
+        resp = CVGenerationResponse.model_construct(
+            template_id="T_TEST",
+            job_id="JOB1",
+            language="en",
+            sections={
+                "profile_summary": SectionContent.model_construct(text=long_text),
+            },
+            metadata=meta,
+            skills=None,
+        )
+
+        template_info: Dict[str, Any] = {
+            "sections_order": ["profile_summary"],
+            "max_chars_per_section": {"profile_summary": 10},  # very small → truncation
+        }
+
+        # Config: small default max, truncation enabled, overflow_limit=0 to *force* truncation
+        def _cfg() -> Dict[str, Any]:
+            return {
+                "validation": {
+                    "max_section_chars_default": 50,
+                    "drop_empty_sections": True,
+                    "enable_safety_cleaning": True,
+                    "max_skills": 10,
+                    "strict_mode": False,
+                },
+                "truncation_config": {
+                    "truncation_enable": True,
+                    "overflow_limit": 0,     # no overflow allowed → must cut at max_len
+                    "reduction_limit": 0.15,
+                },
+            }
+
+        captured_full_text: Dict[str, str] = {}
+
+        def _fake_validate_justification(justification: Any, full_text: str) -> Any:
+            # Capture the text Stage C passes into justification validation
+            captured_full_text["text"] = full_text
+            return justification
+
+        with patch("functions.stage_c_validation.load_parameters", _cfg), \
+             patch("functions.stage_c_validation.validate_justification_against_text", _fake_validate_justification):
+
+            validated = run_stage_c_validation(
+                resp,
+                template_info=template_info,
+                original_request=None,
+            )
+
+        # 1) Justification must have seen the FULL pre-truncation text
+        self.assertIn("text", captured_full_text, "validate_justification_against_text was not called")
+        self.assertEqual(
+            captured_full_text["text"],
+            long_text,
+            msg="Justification should be validated against FULL (pre-truncation) text.",
+        )
+
+        # 2) Final section text may be truncated to the template limit
+        final_text = validated.sections["profile_summary"].text
+        self.assertLessEqual(
+            len(final_text),
+            10,
+            msg=f"Expected profile_summary to be truncated to <=10 chars, got len={len(final_text)}",
+        )
+        # And obviously shorter than the original
+        self.assertLess(len(final_text), len(long_text))
 
 if __name__ == "__main__":
     unittest.main()

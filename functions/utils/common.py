@@ -365,24 +365,37 @@ def select_llm_client_and_params() -> Tuple[Any, Dict[str, Any]]:
 # token budget selection based on section and params
 # ---------------------------------------------------------------------------
 
+def _normalize_budget_section_id(section_id: str, budgets_cfg: dict[str, Any]) -> str:
+    """
+    Map helper/secondary section IDs to their logical budget key.
+
+    Priority:
+      1) If there is an exact entry, use it.
+      2) For *_augment / *_bullets / *_justification, fall back to the base section if present.
+      3) Otherwise, use the original section_id and let caller fall back to 'default'.
+    """
+    if section_id in budgets_cfg:
+        return section_id
+
+    suffixes = ("_augment", "_bullets", "_justification")
+    for suf in suffixes:
+        if section_id.endswith(suf):
+            base = section_id[: -len(suf)]
+            if base in budgets_cfg:
+                return base
+
+    return section_id
+
+
 def resolve_token_budget(section_id: str, attempt: int, params: dict) -> int | None:
-    """
-    Pure function for determining max_output_tokens for a given section+attempt.
-
-    Inputs:
-        section_id : str
-        attempt    : int (1-based)
-        params     : dict loaded from parameters.yaml
-
-    Behaviour:
-        - Looks at params["section_token_budgets"]
-        - Accepts scalar (int) or list/tuple per section
-        - Clamps attempt to last item for lists
-        - Falls back to "default" if section-specific entry not found
-    """
     budgets_cfg = (params.get("section_token_budgets") or {}).copy()
-    raw = budgets_cfg.get(section_id, budgets_cfg.get("default"))
+    if not budgets_cfg:
+        return None
 
+    # NEW: normalize helper sections to their base budget key
+    key = _normalize_budget_section_id(section_id, budgets_cfg)
+
+    raw = budgets_cfg.get(key, budgets_cfg.get("default"))
     if raw is None:
         return None
 
