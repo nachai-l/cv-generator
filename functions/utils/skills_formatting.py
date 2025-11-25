@@ -271,3 +271,71 @@ def match_canonical_skill(
             return best_canon
 
     return None
+
+# ---------------------------------------------------------------------------
+# JD matching helpers (pure, no Stage B / LLM deps)
+# ---------------------------------------------------------------------------
+
+def compute_section_matched_jd_skills(
+    section_id: str,
+    section_text: str,
+    skills_output: List[OutputSkillItem] | None,
+    jd_target_skill_names: List[str] | set[str],
+) -> List[str]:
+    """
+    Given:
+      - section_id (e.g. 'profile_summary', 'skills', 'experience')
+      - section_text: rendered text of the section
+      - skills_output: final structured skills list (taxonomy + inferred)
+      - jd_target_skill_names: iterable of JD skill names (strings)
+
+    Return:
+      - A list of skill *names* (canonical/pretty) that:
+          * appear in jd_target_skill_names (case-insensitive), and
+          * are evidenced by this section.
+
+    Rules:
+      - For 'skills' section:
+          → any skills in `skills_output` that are in JD are considered matched.
+      - For all other sections:
+          → require that the skill name appears as a word in section_text
+            (case-insensitive, word-boundary-aware).
+    """
+    if not jd_target_skill_names or not skills_output:
+        return []
+
+    # Normalize JD target skills to lowercase set
+    jd_set = {str(name).strip().lower() for name in jd_target_skill_names if str(name).strip()}
+    if not jd_set:
+        return []
+
+    text_lc = (section_text or "").lower()
+
+    # Map lowercase name → pretty name from skills_output
+    skill_by_lc: Dict[str, str] = {}
+    for s in skills_output:
+        name = (getattr(s, "name", None) or "").strip()
+        if not name:
+            continue
+        skill_by_lc[name.lower()] = name
+
+    matched_lc: set[str] = set()
+
+    for name_lc, pretty in skill_by_lc.items():
+        if name_lc not in jd_set:
+            continue
+
+        if section_id == "skills":
+            # Structured skills section: being in skills_output + JD is enough
+            matched_lc.add(name_lc)
+        else:
+            # Other sections: require mention in text as a word
+            if _contains_word_case_insensitive(text_lc, pretty):
+                matched_lc.add(name_lc)
+
+    # Return pretty names in deterministic order
+    pretty_results: List[str] = []
+    for name_lc in sorted(matched_lc):
+        pretty_results.append(skill_by_lc.get(name_lc, name_lc))
+
+    return pretty_results

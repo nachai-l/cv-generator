@@ -81,11 +81,13 @@ from schemas.output_schema import (
 from functions.utils.llm_client import load_parameters
 from functions.utils.llm_metrics import call_llm_section_with_metrics
 from functions.utils.fallbacks import build_section_fallback_text
+from functions.utils.language_tone import describe_language, describe_tone
 from functions.utils.skills_formatting import (
     format_plain_skill_bullets,
     parse_skills_from_bullets,
     is_combined_canonical_name,
     match_canonical_skill,
+    compute_section_matched_jd_skills,
 )
 from functions.utils.experience_functions import (
     ExperienceItem,
@@ -97,7 +99,14 @@ from functions.utils.experience_functions import (
     merge_llm_experience_augmentation,
     parse_experience_bullets_response,
 )
-from functions.utils.language_tone import describe_language, describe_tone
+from functions.utils.claims import (
+    should_require_justification,
+    split_section_and_justification,
+    parse_justification_json,
+    validate_justification_against_text,
+    build_empty_justification,
+    adjust_section_token_budget,
+)
 from functions.utils.common import (
     resolve_token_budget,
     load_yaml_dict,
@@ -105,13 +114,20 @@ from functions.utils.common import (
     get_thb_per_usd_from_params,
     strip_redundant_section_heading,
 )
+from functions.utils.prompts_builder import (
+    build_section_prompt,
+    build_skills_selection_prompt,
+    build_experience_justification_prompt,
+    load_section_prompts_config,
+    _collect_evidence_facts_for_section,
+)
+
 logger = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Module-level configuration (read parameters.yaml exactly once here)
 # ---------------------------------------------------------------------------
-# Optional tiny cache to avoid recompiling the same regex
-_PROMPTS_CACHE: dict[str, str] | None = None
+
 PARAMS = load_parameters() or {}
 
 GENERATION_CFG: Dict[str, Any] = PARAMS.get("generation", {}) or {}
@@ -154,6 +170,8 @@ except (TypeError, ValueError):
 # ---------------------------------------------------------------------------
 # Helper classes / functions
 # ---------------------------------------------------------------------------
+
+
 @dataclass
 class StageBTelemetry:
     total_input_tokens: int = 0
@@ -186,6 +204,7 @@ class StageBTelemetry:
     def cost_estimate_thb(self) -> float:
         rate = get_thb_per_usd_from_params()
         return float(self.total_cost_usd) * float(rate)
+
 
 class _CallableToClientAdapter:
     """
@@ -268,11 +287,12 @@ class _CallableToClientAdapter:
 
 def _extract_training_year(entry):
     return (
-        extract_year_from_date(getattr(entry, "year", None)) or
-        extract_year_from_date(getattr(entry, "start_date", None)) or
-        extract_year_from_date(getattr(entry, "end_date", None)) or
-        extract_year_from_date(getattr(entry, "training_date", None))
+        extract_year_from_date(getattr(entry, "year", None))
+        or extract_year_from_date(getattr(entry, "start_date", None))
+        or extract_year_from_date(getattr(entry, "end_date", None))
+        or extract_year_from_date(getattr(entry, "training_date", None))
     )
+
 
 def _render_experience_header(entry: Any) -> str:
     """
@@ -283,6 +303,50 @@ def _render_experience_header(entry: Any) -> str:
     """
     return render_experience_header(entry)
 
+
+def _extract_jd_target_skills(request: CVGenerationRequest) -> set[str]:
+    """
+    Collect target JD skills from job_role_info / job_position_info, if present.
+
+    Expected shapes (examples only):
+      job_role_info.required_skills: list[str] or list[{"name": str, ...}]
+      job_position_info.required_skills: same idea.
+
+    Returns:
+        set[str]: normalized (lowercased) skill names.
+    """
+
+    def _names_from_list(raw: Any) -> set[str]:
+        out: set[str] = set()
+        if not raw:
+            return out
+        for item in raw:
+            if isinstance(item, str):
+                name = item.strip()
+            elif isinstance(item, dict):
+                name = str(item.get("name", "")).strip()
+            else:
+                name = str(item).strip()
+            if name:
+                out.add(name.lower())
+        return out
+
+    jd_skills: set[str] = set()
+
+    job_role_info = getattr(request, "job_role_info", None) or {}
+    job_position_info = getattr(request, "job_position_info", None) or {}
+
+    for src in (job_role_info, job_position_info):
+        if not isinstance(src, dict):
+            continue
+        for key in ("required_skills", "preferred_skills", "skills"):
+            if key in src:
+                jd_skills |= _names_from_list(src.get(key))
+
+    logger.info("jd_target_skills_extracted", count=len(jd_skills))
+    return jd_skills
+
+
 BAD_SECTION_HEADINGS = (
     "training",
     "training section",
@@ -292,53 +356,6 @@ BAD_SECTION_HEADINGS = (
     "ผลงานตีพิมพ์",
     "การฝึกอบรม",
 )
-
-# def _load_prompts_from_file() -> dict[str, str]:
-#     """
-#     Load prompts from parameters/prompts.yaml if present, and merge with
-#     generation.prompts from parameters.yaml (used heavily in tests_utils).
-#
-#     Precedence:
-#     1. prompts.yaml (file) – highest precedence
-#     2. generation.prompts from load_parameters() – used as fallback/override in tests_utils
-#     """
-#     prompts: dict[str, str] = {}
-#
-#     # 1) Try parameters/prompts.yaml (or whatever PROMPTS_FILE points to)
-#     path = Path(__file__).resolve().parent.parent / "parameters" / PROMPTS_FILE
-#     try:
-#         cfg = load_yaml_dict(path)
-#         # supports both:
-#         #   prompts:
-#         #     default: "..."
-#         # or a root-level dict of prompts
-#         candidate = cfg.get("prompts", cfg) if isinstance(cfg, dict) else {}
-#         if isinstance(candidate, dict):
-#             for k, v in candidate.items():
-#                 prompts[str(k)] = str(v)
-#     except Exception as e:
-#         logger.error(
-#             "yaml_file_load_error",
-#             path=str(path),
-#             error=str(e),
-#         )
-#
-#     # 2) Merge generation.prompts from parameters.yaml (tests_utils patch load_parameters())
-#     try:
-#         params = load_parameters() or {}
-#         gen_cfg = params.get("generation", {}) or {}
-#         param_prompts = gen_cfg.get("prompts") or {}
-#         if isinstance(param_prompts, dict):
-#             # Do not overwrite explicit file prompts
-#             for k, v in param_prompts.items():
-#                 prompts.setdefault(str(k), str(v))
-#     except Exception as e:
-#         logger.warning(
-#             "prompts_load_parameters_failed",
-#             error=str(e),
-#         )
-#
-#     return prompts
 
 
 def _get_available_sections(request: CVGenerationRequest) -> set[str]:
@@ -445,6 +462,7 @@ def _get_available_sections(request: CVGenerationRequest) -> set[str]:
     logger.info("resolved_available_sections", available_sections=list(available))
     return available
 
+
 def _resolve_effective_sections(
     request: CVGenerationRequest,
     available_sections: set[str],
@@ -519,6 +537,7 @@ def _resolve_effective_sections(
         # Order here doesn't matter much because we never render a text section
         # for skills_structured, but appending is simple and safe.
         requested.append("skills_structured")
+
     # ------------------------------------------------------------
     # Step 4: filter by available_sections
     # ------------------------------------------------------------
@@ -560,152 +579,105 @@ def _get_section_char_limits(request: CVGenerationRequest) -> Dict[str, int]:
 # ---------------------------------------------------------------------------
 # Education section local helper
 # ---------------------------------------------------------------------------
-def _format_education_fact_entry(entry: Any) -> str | None:
-    """Format a single education entry into a concise fact string.
-
-    Supports:
-    - object-like entries (attrs: degree, institution, major, gpa, start_date, graduation_date)
-    - dict-like entries with the same keys
-    - plain strings (returned as-is)
-    """
-    if isinstance(entry, str):
-        val = entry.strip()
-        return val or None
-
-    # Attribute or dict access helpers
-    def _get(attr: str) -> Any:
-        if hasattr(entry, attr):
-            return getattr(entry, attr)
-        if isinstance(entry, dict):
-            return entry.get(attr)
-        return None
-
-    degree = _get("degree")
-    institution = _get("institution")
-    major = _get("major")
-    gpa = _get("gpa")
-    honors = _get("honors")
-    start_date = _get("start_date")
-    graduation_date = _get("graduation_date")
-
-    parts: List[str] = []
-
-    # Degree + major
-    if degree and major:
-        parts.append(str(degree))
-        # Major might already be in degree name; keep it explicit for robustness
-        parts.append(f"Major: {major}")
-    elif degree:
-        parts.append(str(degree))
-    elif major:
-        parts.append(f"Major: {major}")
-
-    # Institution
-    if institution:
-        parts.append(str(institution))
-
-    # GPA
-    if gpa is not None:
-        parts.append(f"GPA: {gpa}")
-
-    # Honors / distinctions
-    if honors:
-        parts.append(f"Honors: {honors}")
-
-    # Years
-    start_year = extract_year_from_date(start_date)
-    end_year = extract_year_from_date(graduation_date)
-    if start_year or end_year:
-        if start_year and end_year:
-            parts.append(f"Years: {start_year}–{end_year}")
-        elif start_year:
-            parts.append(f"Years: {start_year}–")
-        else:
-            parts.append(f"Years: –{end_year}")
-
-    if not parts:
-        return None
-
-    return " | ".join(parts)
 
 
-def _collect_education_facts_from_request(request: CVGenerationRequest) -> List[str]:
-    """Collect education facts from student_profile or legacy profile_info.
+# def _format_education_fact_entry(entry: Any) -> str | None:
+#     """Format a single education entry into a concise fact string.
+#
+#     Supports:
+#     - object-like entries (attrs: degree, institution, major, gpa, start_date, graduation_date)
+#     - dict-like entries with the same keys
+#     - plain strings (returned as-is)
+#     """
+#     if isinstance(entry, str):
+#         val = entry.strip()
+#         return val or None
+#
+#     # Attribute or dict access helpers
+#     def _get(attr: str) -> Any:
+#         if hasattr(entry, attr):
+#             return getattr(entry, attr)
+#         if isinstance(entry, dict):
+#             return entry.get(attr)
+#         return None
+#
+#     degree = _get("degree")
+#     institution = _get("institution")
+#     major = _get("major")
+#     gpa = _get("gpa")
+#     honors = _get("honors")
+#     start_date = _get("start_date")
+#     graduation_date = _get("graduation_date")
+#
+#     parts: List[str] = []
+#
+#     # Degree + major
+#     if degree and major:
+#         parts.append(str(degree))
+#         # Major might already be in degree name; keep it explicit for robustness
+#         parts.append(f"Major: {major}")
+#     elif degree:
+#         parts.append(str(degree))
+#     elif major:
+#         parts.append(f"Major: {major}")
+#
+#     # Institution
+#     if institution:
+#         parts.append(str(institution))
+#
+#     # GPA
+#     if gpa is not None:
+#         parts.append(f"GPA: {gpa}")
+#
+#     # Honors / distinctions
+#     if honors:
+#         parts.append(f"Honors: {honors}")
+#
+#     # Years
+#     start_year = extract_year_from_date(start_date)
+#     end_year = extract_year_from_date(graduation_date)
+#     if start_year or end_year:
+#         if start_year and end_year:
+#             parts.append(f"Years: {start_year}–{end_year}")
+#         elif start_year:
+#             parts.append(f"Years: {start_year}–")
+#         else:
+#             parts.append(f"Years: –{end_year}")
+#
+#     if not parts:
+#         return None
+#
+#     return " | ".join(parts)
 
-    This is used to enrich the LLM prompt for the 'education' section.
-    """
-    facts: List[str] = []
-
-    # Preferred path: student_profile.education
-    student_profile = getattr(request, "student_profile", None)
-    if student_profile is not None:
-        edu_list = getattr(student_profile, "education", None)
-        if edu_list:
-            for entry in edu_list:
-                fact = _format_education_fact_entry(entry)
-                if fact:
-                    facts.append(fact)
-
-    # Legacy / fallback: profile_info["education"]
-    if not facts:
-        profile_info = getattr(request, "profile_info", {}) or {}
-        edu_list = profile_info.get("education")
-        if edu_list:
-            for entry in edu_list:
-                fact = _format_education_fact_entry(entry)
-                if fact:
-                    facts.append(fact)
-
-    return facts
-
-@lru_cache(maxsize=1)
-def _load_prompts_from_file() -> dict[str, str]:
-    """
-    Load section-level prompts from parameters/prompts.yaml.
-
-    Expected structure (top-level mapping):
-
-        default: |
-          ...
-        profile_summary: |
-          ...
-        skills_structured: |
-          ...
-        experience: |
-          ...
-        experience_bullets_only: |
-          ...
-        user_draft_rewrite_suffix: |
-          ...
-
-    Returns {} on any error.
-    """
-    try:
-        root = Path(__file__).resolve().parents[1]
-        # PROMPTS_FILE is a filename like "prompts.yaml" (from GENERATION_CFG)
-        candidate = root / "parameters" / PROMPTS_FILE
-
-        if not candidate.exists():
-            # Fallback: PROMPTS_FILE might already contain a subpath
-            candidate_alt = root / PROMPTS_FILE
-            if candidate_alt.exists():
-                candidate = candidate_alt
-
-        data = load_yaml_dict(str(candidate)) or {}
-
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.warning("prompts_config_load_failed", error=str(exc))
-        return {}
-
-    if not isinstance(data, dict):
-        logger.warning(
-            "prompts_config_not_mapping",
-            type=str(type(data)),
-        )
-        return {}
-
-    # Ensure keys are strings
-    return {str(k): v for k, v in data.items()}
+#
+# def _collect_education_facts_from_request(request: CVGenerationRequest) -> List[str]:
+#     """Collect education facts from student_profile or legacy profile_info.
+#
+#     This is used to enrich the LLM prompt for the 'education' section.
+#     """
+#     facts: List[str] = []
+#
+#     # Preferred path: student_profile.education
+#     student_profile = getattr(request, "student_profile", None)
+#     if student_profile is not None:
+#         edu_list = getattr(student_profile, "education", None)
+#         if edu_list:
+#             for entry in edu_list:
+#                 fact = _format_education_fact_entry(entry)
+#                 if fact:
+#                     facts.append(fact)
+#
+#     # Legacy / fallback: profile_info["education"]
+#     if not facts:
+#         profile_info = getattr(request, "profile_info", {}) or {}
+#         edu_list = profile_info.get("education")
+#         if edu_list:
+#             for entry in edu_list:
+#                 fact = _format_education_fact_entry(entry)
+#                 if fact:
+#                     facts.append(fact)
+#
+#     return facts
 
 
 @lru_cache(maxsize=1)
@@ -848,6 +820,7 @@ def _build_skills_plan_from_profile(request: CVGenerationRequest) -> SkillsSecti
     # Nothing usable
     return None
 
+
 def _build_taxonomy_only_fallback(skills_plan: SkillsSectionPlan) -> list[OutputSkillItem]:
     """
     Last-resort fallback: return taxonomy skills unchanged.
@@ -867,6 +840,7 @@ def _build_taxonomy_only_fallback(skills_plan: SkillsSectionPlan) -> list[Output
         )
         for sk in skills_plan.canonical_skills
     ]
+
 
 def _extract_original_skill_levels(request: CVGenerationRequest) -> dict[str, str]:
     """
@@ -922,7 +896,6 @@ def _extract_original_skill_levels(request: CVGenerationRequest) -> dict[str, st
     return levels
 
 
-
 def _reconcile_skill_levels_with_request(
     request: CVGenerationRequest,
     skills_output: list[OutputSkillItem] | None,
@@ -971,6 +944,7 @@ def _reconcile_skill_levels_with_request(
 
     return skills_output
 
+
 def _summarize_skills_telemetry(
     skills_output: list[OutputSkillItem] | None,
 ) -> dict[str, Any]:
@@ -998,6 +972,7 @@ def _summarize_skills_telemetry(
         "taxonomy_count": taxonomy,
         "inferred_count": inferred,
     }
+
 
 def _normalize_section_id_for_evidence(section_id: str) -> str:
     """Map internal/derived section IDs to their canonical evidence section name.
@@ -1046,85 +1021,85 @@ def _to_serializable(value: Any) -> Any:
         return str(value)
 
 
-def _collect_evidence_facts_for_section(
-    evidence_plan: EvidencePlan | None,
-    section_id: str,
-) -> List[str]:
-    """
-    Collect evidence facts for a section, *including* any cross-section
-    sharing rules from CROSS_SECTION_CFG (from parameters.yaml).
-    """
-    if evidence_plan is None:
-        return []
-
-    canonical_section_id = _normalize_section_id_for_evidence(section_id)
-
-    cross_cfg: Dict[str, Any] = CROSS_SECTION_CFG or {}
-
-    # Prefer explicit rule for the actual section_id; fall back to canonical
-    cfg_key = section_id if section_id in cross_cfg else canonical_section_id
-    share_from = cross_cfg.get(cfg_key, cross_cfg.get("default", [])) or []
-
-    sections_to_pull: set[str] = {canonical_section_id}
-
-    # If "all" is present, we will expand to all known sections below
-    use_all = "all" in share_from
-    if not use_all:
-        for src in share_from:
-            if isinstance(src, str) and src:
-                sections_to_pull.add(src)
-
-    evidence_facts: List[str] = []
-    seen_ids: set[str] = set()
-
-    # ---------------------------
-    # Preferred API path
-    # ---------------------------
-    if hasattr(evidence_plan, "get_evidence_for_section"):
-        # If "all" → include every section we know about
-        if use_all:
-            hints = getattr(evidence_plan, "section_hints", {}) or {}
-            for sec in hints.keys():
-                sections_to_pull.add(sec)
-
-        for sec in sections_to_pull:
-            for ev in evidence_plan.get_evidence_for_section(sec) or []:
-                ev_id = getattr(ev, "evidence_id", None)
-                if ev_id and ev_id in seen_ids:
-                    continue
-                if ev_id:
-                    seen_ids.add(ev_id)
-                fact = getattr(ev, "fact", None)
-                if fact:
-                    evidence_facts.append(fact)
-
-        return evidence_facts
-
-    # ---------------------------
-    # Fallback: manual wiring via section_hints + evidences
-    # ---------------------------
-    hints = getattr(evidence_plan, "section_hints", {}) or {}
-    evidences = getattr(evidence_plan, "evidences", []) or []
-
-    # Start with canonical; hints may already contain it
-    ids_for_section = set(hints.get(canonical_section_id, []))
-
-    if use_all:
-        for ev in evidences:
-            ev_id = getattr(ev, "evidence_id", None)
-            if ev_id:
-                ids_for_section.add(ev_id)
-    else:
-        for src_section in share_from:
-            ids_for_section.update(hints.get(src_section, []))
-
-    for ev in evidences:
-        ev_id = getattr(ev, "evidence_id", None)
-        fact = getattr(ev, "fact", None)
-        if ev_id in ids_for_section and fact:
-            evidence_facts.append(fact)
-
-    return evidence_facts
+# def _collect_evidence_facts_for_section(
+#     evidence_plan: EvidencePlan | None,
+#     section_id: str,
+# ) -> List[str]:
+#     """
+#     Collect evidence facts for a section, *including* any cross-section
+#     sharing rules from CROSS_SECTION_CFG (from parameters.yaml).
+#     """
+#     if evidence_plan is None:
+#         return []
+#
+#     canonical_section_id = _normalize_section_id_for_evidence(section_id)
+#
+#     cross_cfg: Dict[str, Any] = CROSS_SECTION_CFG or {}
+#
+#     # Prefer explicit rule for the actual section_id; fall back to canonical
+#     cfg_key = section_id if section_id in cross_cfg else canonical_section_id
+#     share_from = cross_cfg.get(cfg_key, cross_cfg.get("default", [])) or []
+#
+#     sections_to_pull: set[str] = {canonical_section_id}
+#
+#     # If "all" is present, we will expand to all known sections below
+#     use_all = "all" in share_from
+#     if not use_all:
+#         for src in share_from:
+#             if isinstance(src, str) and src:
+#                 sections_to_pull.add(src)
+#
+#     evidence_facts: List[str] = []
+#     seen_ids: set[str] = set()
+#
+#     # ---------------------------
+#     # Preferred API path
+#     # ---------------------------
+#     if hasattr(evidence_plan, "get_evidence_for_section"):
+#         # If "all" → include every section we know about
+#         if use_all:
+#             hints = getattr(evidence_plan, "section_hints", {}) or {}
+#             for sec in hints.keys():
+#                 sections_to_pull.add(sec)
+#
+#         for sec in sections_to_pull:
+#             for ev in evidence_plan.get_evidence_for_section(sec) or []:
+#                 ev_id = getattr(ev, "evidence_id", None)
+#                 if ev_id and ev_id in seen_ids:
+#                     continue
+#                 if ev_id:
+#                     seen_ids.add(ev_id)
+#                 fact = getattr(ev, "fact", None)
+#                 if fact:
+#                     evidence_facts.append(fact)
+#
+#         return evidence_facts
+#
+#     # ---------------------------
+#     # Fallback: manual wiring via section_hints + evidences
+#     # ---------------------------
+#     hints = getattr(evidence_plan, "section_hints", {}) or {}
+#     evidences = getattr(evidence_plan, "evidences", []) or []
+#
+#     # Start with canonical; hints may already contain it
+#     ids_for_section = set(hints.get(canonical_section_id, []))
+#
+#     if use_all:
+#         for ev in evidences:
+#             ev_id = getattr(ev, "evidence_id", None)
+#             if ev_id:
+#                 ids_for_section.add(ev_id)
+#     else:
+#         for src_section in share_from:
+#             ids_for_section.update(hints.get(src_section, []))
+#
+#     for ev in evidences:
+#         ev_id = getattr(ev, "evidence_id", None)
+#         fact = getattr(ev, "fact", None)
+#         if ev_id in ids_for_section and fact:
+#             evidence_facts.append(fact)
+#
+#     return evidence_facts
 
 
 # ---------------------------------------------------------------------------
@@ -1166,221 +1141,8 @@ class CVGenerationEngine:
         self._llm_usage_records: list[Dict[str, Any]] = []
 
     # ------------------------------------------------------------------
-    # Prompt building
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _build_section_prompt(
-        request: CVGenerationRequest,
-        evidence_plan: EvidencePlan | None,
-        section_id: str,
-    ) -> str:
-        """Construct an LLM prompt for a single CV section (with full cross-section context)."""
-        prompts_cfg: Dict[str, str] = _load_prompts_from_file()
-
-        # 🔹 Resolve language and tone
-        raw_language = getattr(request, "language", "en")
-        language = raw_language or "en"
-        language_name = describe_language(language)
-
-        tone = (
-            getattr(request, "tone", None)
-            or getattr(request, "style_tone", None)
-            or getattr(getattr(request, "template_info", None), "tone", None)
-        )
-        tone_desc = describe_tone(tone)
-
-        # Legacy-style fields (may be dicts or models); we normalize them
-        raw_profile_info = getattr(request, "profile_info", None)
-        if not raw_profile_info:
-            # New API shape: fall back to student_profile
-            raw_profile_info = getattr(request, "student_profile", None) or {}
-
-        raw_job_role_info = getattr(request, "job_role_info", None) or {}
-        raw_job_position_info = getattr(request, "job_position_info", None) or {}
-        raw_company_info = getattr(request, "company_info", None) or {}
-        drafts = getattr(request, "user_input_cv_text_by_section", {}) or {}
-
-        profile_info = _to_serializable(raw_profile_info)
-        job_role_info = _to_serializable(raw_job_role_info)
-        job_position_info = _to_serializable(raw_job_position_info)
-        company_info = _to_serializable(raw_company_info)
-
-        user_draft = drafts.get(section_id)
-
-        # ------------------------------------------------------------
-        # Evidence facts + education-specific enrichment
-        # ------------------------------------------------------------
-        evidence_facts: List[str] = []
-
-        # From EvidencePlan (if any)
-        ep_facts = _collect_evidence_facts_for_section(evidence_plan, section_id)
-        if ep_facts:
-            evidence_facts.extend(ep_facts)
-
-        # Enrich education section with structured education info
-        if section_id == "education":
-            edu_facts = _collect_education_facts_from_request(request)
-            if edu_facts:
-                evidence_facts.extend(edu_facts)
-
-        lines: List[str] = [
-            "You are an expert CV writer.",
-            f"The CV language is {language_name} (language_code='{language}').",
-            f"The overall tone of the CV is {tone_desc}.",
-            "",
-            f"Generate a strong '{section_id}' section in {language_name} for the candidate below.",
-            "",
-            "=== Profile Info (JSON) ===",
-            json.dumps(profile_info, ensure_ascii=False, indent=2),
-            "",
-            "=== Target Job Role / Position / Company (JSON) ===",
-            json.dumps(
-                {
-                    "job_role_info": job_role_info,
-                    "job_position_info": job_position_info,
-                    "company_info": company_info,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-        ]
-
-        lines.append(f"\n=== Evidence Facts for {section_id} ===")
-        lines.extend(
-            [f"- {fact}" for fact in evidence_facts]
-            or ["- (No specific evidence provided)"]
-        )
-
-        if user_draft:
-            lines.append(f"\n=== User Draft for {section_id} ===")
-            draft_text = user_draft if isinstance(user_draft, str) else str(user_draft)
-            lines.append(draft_text)
-
-            # Optional suffix from prompts.yaml / parameters
-            draft_suffix = prompts_cfg.get("user_draft_rewrite_suffix", "")
-            if draft_suffix:
-                lines.append("\n" + draft_suffix)
-
-        # 🔹 Append section-specific or default prompt as "Output Requirements"
-        default_prompt = prompts_cfg.get("default") or (
-            "Write this CV section in a clear, concise, and professional style."
-        )
-        section_prompt = (prompts_cfg.get(section_id) or default_prompt).strip()
-
-        lines.append("\n=== Output Requirements ===")
-        lines.append(section_prompt)
-
-        return "\n".join(lines)
-
-
-    @staticmethod
-    def _build_skills_selection_prompt(
-        request: CVGenerationRequest,
-        evidence_plan: EvidencePlan | None,
-        skills_plan: SkillsSectionPlan,
-        language: str,
-    ) -> str:
-        """Build JSON-only prompt for structured skills selection.
-
-        Even though the output is JSON, we still surface:
-        - Target CV language  → affects naming of inferred skills.
-        - Desired tone        → helps the LLM choose appropriate phrasing.
-        """
-        prompts_cfg: dict[str, str] = _load_prompts_from_file()
-        base_prompt: str = prompts_cfg.get("skills_structured", "")
-
-        if not base_prompt:
-            logger.warning(
-                "skills_structured_prompt_missing_using_default",
-                message=(
-                    "skills_structured not found in prompts.yaml; "
-                    "using a built-in JSON-only prompt instead."
-                ),
-            )
-            base_prompt = (
-                "You are an assistant that selects and structures the candidate's skills.\n"
-                "Return ONLY valid JSON matching this schema:\n"
-                "{\n"
-                '  "items": [\n'
-                '    { "name": string, "level": string | null, "keep": boolean, "source": "taxonomy" | "inferred" }\n'
-                "  ]\n"
-                "}\n"
-            )
-
-        # 🔹 Resolve language & tone (request.language overrides function arg)
-        raw_language = getattr(request, "language", None) or language or "en"
-        language_code = raw_language or "en"
-        language_name = describe_language(language_code)
-
-        tone = (
-            getattr(request, "tone", None)
-            or getattr(request, "style_tone", None)
-            or getattr(getattr(request, "template_info", None), "tone", None)
-        )
-        tone_desc = describe_tone(tone)
-
-        evidence_facts: List[str] = _collect_evidence_facts_for_section(
-            evidence_plan, "skills_structured"
-        )
-
-        raw_profile_info = getattr(request, "profile_info", None)
-        if not raw_profile_info:
-            raw_profile_info = getattr(request, "student_profile", None) or {}
-
-        raw_job_role_info = getattr(request, "job_role_info", None) or {}
-        raw_job_position_info = getattr(request, "job_position_info", None) or {}
-        raw_company_info = getattr(request, "company_info", None) or {}
-
-        profile_info = _to_serializable(raw_profile_info)
-        job_role_info = _to_serializable(raw_job_role_info)
-        job_position_info = _to_serializable(raw_job_position_info)
-        company_info = _to_serializable(raw_company_info)
-
-        lines: List[str] = [
-            f"The CV language is {language_name} (language_code='{language_code}').",
-            f"The overall tone of the CV is {tone_desc}.",
-            "",
-            "Student profile (structured JSON):",
-            json.dumps(profile_info, ensure_ascii=False, indent=2),
-        ]
-
-        if job_role_info or job_position_info or company_info:
-            lines.append("")
-            lines.append("Target job context (structured JSON):")
-            context = {
-                "job_role_info": job_role_info,
-                "job_position_info": job_position_info,
-                "company_info": company_info,
-            }
-            lines.append(json.dumps(context, ensure_ascii=False, indent=2))
-
-        lines.extend(
-            [
-                "",
-                "=== Skills selection instructions ===",
-                base_prompt,
-                "",
-                "Canonical skills (from taxonomy):",
-            ]
-        )
-
-        for sk in skills_plan.canonical_skills:
-            level = sk.level or "null"
-            lines.append(f'- name: "{sk.name}", level: "{level}"')
-
-        if evidence_facts:
-            lines.append("")
-            lines.append("=== Evidence facts for skills (cross-section) ===")
-            for fact in evidence_facts:
-                lines.append(f"- {fact}")
-
-        return "\n".join(lines)
-
-    # ------------------------------------------------------------------
     # LLM call with retries (Option C: feature flag for zero-token retry)
     # ------------------------------------------------------------------
-
     @staticmethod
     def _get_section_token_budget_for_attempt(
         section_id: str,
@@ -1401,7 +1163,25 @@ class CVGenerationEngine:
             except Exception:
                 return None
 
-        return resolve_token_budget(section_id, attempt, all_params)
+        # Base budget from section_token_budgets
+        base_budget = resolve_token_budget(section_id, attempt, all_params)
+
+        # If resolve_token_budget() has no idea, just return as-is
+        if base_budget is None:
+            return None
+
+        # Generation config (where justification flags & extra tokens live)
+        generation_cfg = all_params.get("generation", {}) or {}
+
+        # Let claims.py decide whether and how to bump the budget
+        adjusted_budget = adjust_section_token_budget(
+            section_id=section_id,
+            base_budget=base_budget,
+            generation_cfg=generation_cfg,
+        )
+
+        return adjusted_budget
+
 
     def _aggregate_usage_and_cost(self) -> tuple[int, float, float, dict[str, Any]]:
         """
@@ -1455,8 +1235,8 @@ class CVGenerationEngine:
 
         total_tokens = total_input_tokens + total_output_tokens
         total_cost_usd = (
-                total_input_tokens * usd_per_input
-                + total_output_tokens * usd_per_output
+            total_input_tokens * usd_per_input
+            + total_output_tokens * usd_per_output
         )
 
         thb_per_usd = get_thb_per_usd_from_params()
@@ -1521,8 +1301,6 @@ class CVGenerationEngine:
             # --------------------------------------------------------------
             max_tokens_for_attempt: int | None = None
             try:
-                # _get_section_token_budget_for_attempt is expected to use the
-                # section_token_budgets config loaded in __init__.
                 max_tokens_for_attempt = self._get_section_token_budget_for_attempt(
                     section_id=section_id,
                     attempt=attempt,
@@ -1585,8 +1363,8 @@ class CVGenerationEngine:
                 # 2) Handle stub / API error sentinel text
                 # ----------------------------------------------------------
                 is_stub_error = (
-                        raw_text.startswith("[STUB_ERROR:")
-                        or raw_text.startswith("STUB_ERROR:")
+                    raw_text.startswith("[STUB_ERROR:")
+                    or raw_text.startswith("STUB_ERROR:")
                 )
                 is_api_error = raw_text.startswith("[API_ERROR]")
 
@@ -1606,34 +1384,15 @@ class CVGenerationEngine:
                         self._last_retry_count = attempt - 1
                         return ""
 
-                # # ----------------------------------------------------------
-                # # 3) Inspect usage snapshot to detect real vs mock LLM
-                # # ----------------------------------------------------------
-                # usage = getattr(resp, "_llm_usage_snapshot", None)
-                # total_tokens = 0
-                # if isinstance(usage, dict):
-                #     total_tokens = int(usage.get("total_tokens", 0) or 0)
-                #
-                #     # 🔹 Track usage for aggregation (tokens + per-section stats)
-                #     try:
-                #         record = dict(usage)
-                #     except Exception:  # ultra defensive
-                #         record = {"_raw": str(usage)}
-                #     record.setdefault("section_id", section_id)
-                #     self._llm_usage_records.append(record)
                 usage = self._llm_usage_records[-1] if self._llm_usage_records else None
                 total_tokens = int(usage.get("total_tokens", 0) or 0) if usage else 0
-                is_mock_llm = bool(
-                    usage
-                    and usage.get("_source") in (None, "merged")
-                )
 
                 is_mock_llm = (
-                        usage is None
-                        or (
-                                isinstance(usage, dict)
-                                and usage.get("_source") in (None, "merged")
-                        )
+                    usage is None
+                    or (
+                        isinstance(usage, dict)
+                        and usage.get("_source") in (None, "merged")
+                    )
                 )
 
                 # Track last non-empty text
@@ -1644,9 +1403,9 @@ class CVGenerationEngine:
                 # 4) REAL LLM: retry on zero-token output (if enabled)
                 # ----------------------------------------------------------
                 if (
-                        not is_mock_llm
-                        and retry_on_zero_tokens
-                        and total_tokens == 0
+                    not is_mock_llm
+                    and retry_on_zero_tokens
+                    and total_tokens == 0
                 ):
                     logger.warning(
                         "llm_retry_due_to_zero_tokens",
@@ -1734,23 +1493,23 @@ class CVGenerationEngine:
     # Experience section local helper
     # ---------------------------------------------------------------------------
     def _augment_experience_with_llm(
-            self,
-            request: CVGenerationRequest,
-            items: list[ExperienceItem],
+        self,
+        request: CVGenerationRequest,
+        items: list[ExperienceItem],
     ) -> list[ExperienceItem]:
         if not items:
             return items
 
-        prompts_cfg: dict[str, str] = _load_prompts_from_file()
+        prompts_cfg: dict[str, str] = load_section_prompts_config()
         base_style_prompt = prompts_cfg.get("experience", "")
 
         raw_language = getattr(request, "language", "en") or "en"
         language_name = describe_language(raw_language)
 
         tone = (
-                getattr(request, "tone", None)
-                or getattr(request, "style_tone", None)
-                or getattr(getattr(request, "template_info", None), "tone", None)
+            getattr(request, "tone", None)
+            or getattr(request, "style_tone", None)
+            or getattr(getattr(request, "template_info", None), "tone", None)
         )
         tone_desc = describe_tone(tone)
 
@@ -1828,6 +1587,7 @@ class CVGenerationEngine:
 
         # 🔸 delegate parsing + dedup to utils
         return merge_llm_experience_augmentation(items, raw_json)
+
     def _generate_experience_bullets_for_item(
         self,
         request: CVGenerationRequest,
@@ -1846,7 +1606,8 @@ class CVGenerationEngine:
         # -----------------------------
         # LLM path (always attempt)
         # -----------------------------
-        prompts_cfg: dict[str, str] = _load_prompts_from_file()
+
+        prompts_cfg: dict[str, str] = load_section_prompts_config()
         bullets_prompt_template = prompts_cfg.get("experience_bullets_only", "")
 
         raw_language = getattr(request, "language", "en")
@@ -1937,6 +1698,34 @@ class CVGenerationEngine:
                     bullets = candidate_lines[:max_bullets]
 
             if bullets:
+                full_bullet_text = "\n".join(bullets)
+
+                if should_require_justification("experience_bullets_only", GENERATION_CFG):
+                    just_prompt = build_experience_justification_prompt(
+                        request=request,
+                        evidence_plan=self._evidence_plan,
+                        section_text=full_bullet_text,
+                        section_id="experience_bullets_only",
+                    )
+
+                    just_raw = self._call_llm_with_retries(
+                        just_prompt,
+                        section_id="experience_bullets_justification",
+                    )
+
+                    justification = parse_justification_json(just_raw)
+                    justification = validate_justification_against_text(
+                        justification,
+                        full_bullet_text,
+                    )
+
+                    # Store the result so the parent experience section can use it
+                    existing = getattr(self, "_experience_bullets_justification", None)
+                    if existing is None:
+                        self._experience_bullets_justification = justification
+                    else:
+                        existing.evidence_map.extend(justification.evidence_map)
+                        existing.unsupported_claims.extend(justification.unsupported_claims)
                 return bullets
 
         except Exception as exc:
@@ -1997,11 +1786,36 @@ class CVGenerationEngine:
         language = getattr(request, "language", "en")
         evidence_plan: EvidencePlan | None = self._evidence_plan
 
+        # NEW: decide if this run should include justification for skills
+        want_justification = (
+            should_require_justification("skills_structured", GENERATION_CFG)
+            or should_require_justification("skills", GENERATION_CFG)
+        )
+
         # Build the JSON-only selection prompt and call the LLM.
-        prompt = self._build_skills_selection_prompt(
-            request, evidence_plan, skills_plan, language
+        prompt = build_skills_selection_prompt(
+            request=request,
+            evidence_plan=evidence_plan,
+            skills_plan=skills_plan,
+            language=language,
+            require_justification=want_justification,
         )
         raw_json = self._call_llm_with_retries(prompt, section_id="skills_structured")
+
+        # NEW: split SKILLS_JSON vs JUSTIFICATION_JSON when requested
+        skills_raw = raw_json or ""
+        justification_raw = ""
+
+        if want_justification and raw_json:
+            try:
+                skills_raw, justification_raw = split_section_and_justification(raw_json)
+            except Exception as exc:
+                logger.warning(
+                    "skills_justification_split_failed",
+                    error=str(exc),
+                )
+                skills_raw = raw_json or ""
+                justification_raw = ""
 
         # ---------- Canonical lookup (case-insensitive) ----------
         canonical_by_name: dict[str, CanonicalSkill] = {
@@ -2012,7 +1826,7 @@ class CVGenerationEngine:
 
         # ---------- Parse JSON from LLM ----------
         try:
-            cleaned = _strip_markdown_fence(raw_json)
+            cleaned = _strip_markdown_fence(skills_raw)
             if cleaned:
                 data = json.loads(cleaned)
                 if isinstance(data, list):
@@ -2050,7 +1864,7 @@ class CVGenerationEngine:
                 # Drop duplicates, keep the first occurrence.
                 continue
             seen_names_lower.add(key)
-            sel.name = name # normalise whitespace
+            sel.name = name  # normalise whitespace
             filtered.append(sel)
 
         # ---------- Fallback if no usable JSON ----------
@@ -2177,13 +1991,35 @@ class CVGenerationEngine:
         result = filtered_result
 
         # ---------- Final safety: reconcile levels with canonical ----------
-        # Even if some path above misbehaved, this guarantees that any skill
-        # whose name matches a canonical skill ends up with the canonical level.
         for item in result:
             key = (item.name or "").strip().lower()
             canon = canonical_by_name.get(key)
             if canon is not None:
                 item.level = canon.level
+
+        # NEW: parse + validate justification against rendered skills text
+        if want_justification:
+            try:
+                if justification_raw:
+                    j = parse_justification_json(justification_raw)
+                else:
+                    j = build_empty_justification()
+
+                # Render a temporary skills text just for validation
+                skills_text_for_justif = format_plain_skill_bullets(result) or ""
+                j = validate_justification_against_text(
+                    j,
+                    skills_text_for_justif,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "skills_justification_parse_or_validate_failed",
+                    error=str(exc),
+                )
+                j = build_empty_justification()
+
+            # Store for later attachment when we render the 'skills' section
+            self._skills_justification = j
 
         return result
 
@@ -2191,22 +2027,23 @@ class CVGenerationEngine:
     # Build CV response
     # ------------------------------------------------------------------
     def _build_cv_response(
-            self,
-            request: CVGenerationRequest,
-            generated_sections: Union[Dict[str, SectionContent], List[SectionContent]],
-            *,
-            job_id: str | None = None,
-            status: GenerationStatus = GenerationStatus.COMPLETED,
-            generation_time_ms: int | None = None,
-            retry_count: int = 0,
-            cache_hit: bool = False,
-            tokens_used: int = 0,
-            input_tokens: int = 0,
-            output_tokens: int = 0,
-            section_breakdown: list[dict[str, Any]] | None = None,
-            cost_estimate_thb: float = 0.0,
-            cost_estimate_usd: float = 0.0,
-            skills_output: list[OutputSkillItem] | None = None,
+        self,
+        request: CVGenerationRequest,
+        generated_sections: Union[Dict[str, SectionContent], List[SectionContent]],
+        *,
+        job_id: str | None = None,
+        status: GenerationStatus = GenerationStatus.COMPLETED,
+        generation_time_ms: int | None = None,
+        retry_count: int = 0,
+        cache_hit: bool = False,
+        tokens_used: int = 0,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        section_breakdown: list[dict[str, Any]] | None = None,
+        cost_estimate_thb: float = 0.0,
+        cost_estimate_usd: float = 0.0,
+        skills_output: list[OutputSkillItem] | None = None,
+        justification: Justification | None = None,
     ) -> CVGenerationResponse:
         """Normalize generated sections and build CVGenerationResponse."""
         # Normalize sections into a dict
@@ -2244,7 +2081,7 @@ class CVGenerationEngine:
             profile_info=profile_info,
         )
 
-        justification = Justification()
+        justification_obj = justification or Justification()
 
         # Final job_id
         user_part = getattr(request, "user_id", "unknown")
@@ -2256,9 +2093,9 @@ class CVGenerationEngine:
         # Template id (legacy → new → fallback)
         template_info = getattr(request, "template_info", None)
         template_id = (
-                getattr(template_info, "template_id", None)
-                or getattr(request, "template_id", None)
-                or "UNKNOWN_TEMPLATE"
+            getattr(template_info, "template_id", None)
+            or getattr(request, "template_id", None)
+            or "UNKNOWN_TEMPLATE"
         )
 
         payload = {
@@ -2269,7 +2106,7 @@ class CVGenerationEngine:
             "sections": sections_dict,
             "skills": skills_output,
             "metadata": metadata,
-            "justification": justification,
+            "justification": justification_obj,
             "quality_metrics": None,
             "warnings": [],
             "error": None,
@@ -2324,6 +2161,11 @@ class CVGenerationEngine:
             self._last_retry_count = 0
             self._llm_usage_records = []  # reset per-request
             self.telemetry = StageBTelemetry()
+
+            # NEW: per-request justification object (may remain empty if disabled)
+            justification = build_empty_justification()
+            self._skills_justification: Justification | None = None
+            self._experience_bullets_justification = None
 
             char_limits = _get_section_char_limits(request)
             available_sections = _get_available_sections(request)
@@ -2390,12 +2232,13 @@ class CVGenerationEngine:
 
                     # If we have nothing structured, fall back to LLM section generation
                     if not structured_items:
+                        prompt = build_section_prompt(
+                            request,
+                            evidence_plan,
+                            section_id,
+                        )
                         raw_text = self._call_llm_with_retries(
-                            self._build_section_prompt(
-                                request,
-                                evidence_plan,
-                                section_id,
-                            ),
+                            prompt,
                             section_id,
                         )
                         truncated = _truncate_text(
@@ -2468,6 +2311,57 @@ class CVGenerationEngine:
                             reason="experience text too short",
                         )
 
+                    # NEW: experience justification (separate LLM call)
+                    experience_requires_justif = should_require_justification("experience", GENERATION_CFG)
+                    if experience_requires_justif:
+                        try:
+                            just_prompt = build_experience_justification_prompt(
+                                request,
+                                evidence_plan,
+                                section_text,
+                            )
+                            just_raw = self._call_llm_with_retries(
+                                just_prompt,
+                                section_id="experience_justification",
+                            )
+
+                            if just_raw:
+                                try:
+                                    j = parse_justification_json(just_raw)
+                                    j = validate_justification_against_text(
+                                        j,
+                                        section_text,
+                                    )
+                                except Exception as exc:
+                                    logger.warning(
+                                        "experience_justification_parse_or_validate_failed",
+                                        error=str(exc),
+                                    )
+                                    j = build_empty_justification()
+                            else:
+                                j = build_empty_justification()
+
+                            # 🔹 Merge main experience justification
+                            if j:
+                                if j.evidence_map:
+                                    justification.evidence_map.extend(j.evidence_map)
+                                if j.unsupported_claims:
+                                    justification.unsupported_claims.extend(j.unsupported_claims)
+
+                        except Exception as exc:
+                            logger.warning(
+                                "experience_justification_generation_failed",
+                                error=str(exc),
+                            )
+
+                    # 🔹 Always merge bullet-level justification (if any), even if "experience" is not configured
+                    bullet_j = getattr(self, "_experience_bullets_justification", None)
+                    if bullet_j:
+                        if bullet_j.evidence_map:
+                            justification.evidence_map.extend(bullet_j.evidence_map)
+                        if bullet_j.unsupported_claims:
+                            justification.unsupported_claims.extend(bullet_j.unsupported_claims)
+
                     generated_sections[section_id] = SectionContent(
                         text=section_text,
                         word_count=len(section_text.split()),
@@ -2475,7 +2369,6 @@ class CVGenerationEngine:
                         confidence_score=1.0,
                     )
                     continue
-
 
                 # ------------------------------------------------------------------
                 # Special handling: skills text rendered from structured-first output
@@ -2500,29 +2393,69 @@ class CVGenerationEngine:
                             reason="no structured skills available",
                         )
 
+                    # NEW: if we computed a skills justification earlier, attach it
+                    if (
+                        hasattr(self, "_skills_justification")
+                        and self._skills_justification
+                        and self._skills_justification.evidence_map
+                    ):
+                        justification.evidence_map.extend(self._skills_justification.evidence_map)
+
                 else:
                     # --------------------------------------------------------------
                     # Default generation path for all other sections (LLM-backed)
                     # --------------------------------------------------------------
-                    raw_text = self._call_llm_with_retries(
-                        self._build_section_prompt(request, evidence_plan, section_id),
+                    want_justification = should_require_justification(
+                        section_id,
+                        GENERATION_CFG,
+                    )
+
+                    # Build the full prompt ONCE so we can also reuse it as
+                    # the "source text" for justification validation.
+                    prompt_for_section = build_section_prompt(
+                        request,
+                        evidence_plan,
                         section_id,
                     )
 
+                    raw_text = self._call_llm_with_retries(
+                        prompt_for_section,
+                        section_id,
+                    )
+
+                    # --- Split section text vs justification (if enabled) ---
+                    section_text_raw = raw_text or ""
+                    justification_raw = ""
+
+                    if want_justification and raw_text:
+                        try:
+                            section_text_raw, justification_raw = (
+                                split_section_and_justification(raw_text)
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "justification_split_failed",
+                                section_id=section_id,
+                                error=str(exc),
+                            )
+                            section_text_raw = raw_text or ""
+                            justification_raw = ""
+
                     # 🔹 Strip Markdown bold markers from LLM text only in this path
-                    if raw_text:
+                    if section_text_raw:
                         # Keep it simple and conservative: only remove "**"
-                        raw_text = raw_text.replace("**", "")
-                        raw_text =  strip_redundant_section_heading(
-                            raw_text, section_id,
+                        section_text_raw = section_text_raw.replace("**", "")
+                        section_text_raw = strip_redundant_section_heading(
+                            section_text_raw,
+                            section_id,
                             removal_map={
                                 "references": "references",
                                 "additional_info": "additional information",
-                            }
+                            },
                         )
 
                     truncated = _truncate_text(
-                        raw_text or "",
+                        section_text_raw or "",
                         char_limits.get(section_id),
                     )
 
@@ -2540,6 +2473,30 @@ class CVGenerationEngine:
                             reason="LLM output empty",
                         )
 
+                    # NEW: parse + validate justification JSON for this section (if any)
+                    if want_justification:
+                        try:
+                            if justification_raw:
+                                j = parse_justification_json(justification_raw)
+                                # IMPORTANT: validate against *input prompt + context*,
+                                # not the generated section text.
+                                j = validate_justification_against_text(
+                                    j,
+                                    prompt_for_section,
+                                )
+                            else:
+                                j = build_empty_justification()
+                        except Exception as exc:
+                            logger.warning(
+                                "justification_parse_or_validate_failed",
+                                section_id=section_id,
+                                error=str(exc),
+                            )
+                            j = build_empty_justification()
+
+                        if j and j.evidence_map:
+                            justification.evidence_map.extend(j.evidence_map)
+
                     # Legacy mode: derive structured skills from free-text "skills"
                     if (
                         section_id == "skills"
@@ -2552,12 +2509,6 @@ class CVGenerationEngine:
                                 request,
                                 skills_plan,
                                 skills_section_text=text_for_section,
-                            )
-                            logger.warning(
-                                "skills_structured_generation fallback to legacy!",
-                                section_id=section_id,
-                                length=len(text_for_section),
-                                reason="Failed to generate structured skills",
                             )
                         except Exception as exc:
                             logger.error(
@@ -2589,10 +2540,10 @@ class CVGenerationEngine:
                     for ln in lines:
                         core = (
                             ln.strip()
-                              .lstrip("-•* ")
-                              .rstrip(":")
-                              .strip()
-                              .lower()
+                            .lstrip("-•* ")
+                            .rstrip(":")
+                            .strip()
+                            .lower()
                         )
                         if core in BAD_SECTION_HEADINGS:
                             continue
@@ -2605,7 +2556,6 @@ class CVGenerationEngine:
                     matched_jd_skills=[],
                     confidence_score=1.0,
                 )
-
 
             elapsed_ms = int((time.monotonic() - start_time) * 1000)
 
@@ -2623,7 +2573,9 @@ class CVGenerationEngine:
                 )
 
             # 🔹 Aggregate LLM usage and cost (USD → THB) from collected records
-            total_tokens_used, total_cost_thb, total_cost_usd, usage_extra = self._aggregate_usage_and_cost()
+            total_tokens_used, total_cost_thb, total_cost_usd, usage_extra = (
+                self._aggregate_usage_and_cost()
+            )
             usage_by_section = usage_extra.get("usage_by_section", {}) or {}
             section_breakdown = [
                 {
@@ -2639,12 +2591,16 @@ class CVGenerationEngine:
 
             # NEW: expose usage for Stage D
             self._model_name = (
-                    getattr(self, "_model_name", None)
-                    or self.generation_params.get("model")
-                    or "gemini-2.5-flash"
+                getattr(self, "_model_name", None)
+                or self.generation_params.get("model")
+                or "gemini-2.5-flash"
             )
-            self._stage_b_total_input_tokens = int(usage_extra.get("total_input_tokens", 0))
-            self._stage_b_total_output_tokens = int(usage_extra.get("total_output_tokens", 0))
+            self._stage_b_total_input_tokens = int(
+                usage_extra.get("total_input_tokens", 0)
+            )
+            self._stage_b_total_output_tokens = int(
+                usage_extra.get("total_output_tokens", 0)
+            )
             self._stage_b_total_tokens = int(total_tokens_used)
             self._stage_b_total_cost_usd = float(round(total_cost_usd, 4))
             self._stage_b_total_cost_thb = float(round(total_cost_thb, 4))
@@ -2662,9 +2618,28 @@ class CVGenerationEngine:
                 total_input_tokens=usage_extra.get("total_input_tokens", 0),
                 total_output_tokens=usage_extra.get("total_output_tokens", 0),
                 section_breakdown=section_breakdown,
-                # usage_by_section=usage_extra.get("usage_by_section", {}),
                 **skills_metrics,
             )
+
+            # Compute matched_jd_skills per section using structured skills + JD info
+            try:
+                jd_target_skills = _extract_jd_target_skills(request)
+            except Exception as exc:
+                logger.warning(
+                    "jd_target_skills_extraction_failed",
+                    error=str(exc),
+                )
+                jd_target_skills = set()
+
+            if jd_target_skills and generated_sections:
+                for section_id, section in generated_sections.items():
+                    matched = compute_section_matched_jd_skills(
+                        section_id=section_id,
+                        section_text=section.text or "",
+                        skills_output=skills_output,
+                        jd_target_skill_names=jd_target_skills,
+                    )
+                    section.matched_jd_skills = matched or []
 
             return self._build_cv_response(
                 request=request,
@@ -2679,8 +2654,8 @@ class CVGenerationEngine:
                 cost_estimate_thb=round(total_cost_thb, 4),
                 cost_estimate_usd=round(total_cost_usd, 4),
                 skills_output=skills_output,
+                justification=justification,
             )
-
 
         finally:
             clear_contextvars()

@@ -9,22 +9,22 @@ Covered here:
 
 - _build_taxonomy_only_fallback
 - _summarize_skills_telemetry
-- _render_experience_header
+- render_experience_header
 """
 
 from __future__ import annotations
 
 import unittest
-from typing import Any, Dict, List, cast, Optional  # 🔹 add List
+from typing import Any, Dict, List, cast, Optional
 from dataclasses import dataclass
 
 import functions.stage_b_generation as stage_b_generation
 from functions.stage_b_generation import (
     _build_taxonomy_only_fallback,
     _summarize_skills_telemetry,
-    _render_experience_header,  # 🔹 new import
 )
 from functions.stage_b_generation import CVGenerationEngine
+from functions.utils.experience_functions import render_experience_header
 from .test_stage_b_generation import LoggingTestCase, DummyRequest
 from schemas.input_schema import CVGenerationRequest
 from schemas.internal_schema import SkillsSectionPlan, CanonicalSkill
@@ -32,7 +32,7 @@ from schemas.output_schema import OutputSkillItem
 
 
 # ----------------------------------------------------------------------
-# New tests_utils for _render_experience_header
+# New tests_utils for render_experience_header
 # ----------------------------------------------------------------------
 @dataclass
 class ExperienceItem:
@@ -48,8 +48,9 @@ class ExperienceItem:
     responsibilities: List[str]
     source: str = "profile"
 
+
 class TestRenderExperienceHeader(unittest.TestCase):
-    """Unit tests_utils for _render_experience_header helper."""
+    """Unit tests_utils for render_experience_header helper."""
 
     def test_full_dict_entry_uses_position_and_years(self) -> None:
         """position should be preferred over title / job_title."""
@@ -62,11 +63,11 @@ class TestRenderExperienceHeader(unittest.TestCase):
             "end_date": "2023-03-31",
         }
 
-        header = _render_experience_header(entry)
+        header = render_experience_header(entry)
 
         expected = (
-            "**Assistant Manager, Research Division**\n"
-            "*Mitsui Chemicals Singapore R&D Centre, 2017–2023*"
+            "Assistant Manager, Research Division| "
+            "Mitsui Chemicals Singapore R&D Centre| 2017–2023"
         )
         self.assertEqual(header, expected)
 
@@ -78,9 +79,9 @@ class TestRenderExperienceHeader(unittest.TestCase):
             "end_date": None,  # Present
         }
 
-        header = _render_experience_header(entry)
+        header = render_experience_header(entry)
 
-        expected = "*Mojia Biotech Pte. Ltd., 2023–Present*"
+        expected = "Mojia Biotech Pte. Ltd.| 2023–Present"
         self.assertEqual(header, expected)
 
     def test_missing_dates_does_not_invent_years(self) -> None:
@@ -92,16 +93,14 @@ class TestRenderExperienceHeader(unittest.TestCase):
             "end_date": None,
         }
 
-        header = _render_experience_header(entry)
+        header = render_experience_header(entry)
 
-        expected = (
-            "**Senior Researcher**\n"
-            "*Example Labs*"
-        )
+        expected = "Senior Researcher| Example Labs"
         self.assertEqual(header, expected)
 
     def test_object_like_entry_supported(self) -> None:
         """Attribute-based entries should work like dict-based ones."""
+
         class Obj:
             def __init__(self) -> None:
                 self.position = "Lead Data Scientist"
@@ -110,17 +109,14 @@ class TestRenderExperienceHeader(unittest.TestCase):
                 self.end_date = "2022-12-31"
 
         entry = Obj()
-        header = _render_experience_header(entry)
+        header = render_experience_header(entry)
 
-        expected = (
-            "**Lead Data Scientist**\n"
-            "*True Digital Group, 2020–2022*"
-        )
+        expected = "Lead Data Scientist| True Digital Group| 2020–2022"
         self.assertEqual(header, expected)
 
 
 # ----------------------------------------------------------------------
-# Existing tests_utils (unchanged) …
+# Existing tests_utils …
 # ----------------------------------------------------------------------
 
 
@@ -202,6 +198,7 @@ class TestSummarizeSkillsTelemetry(unittest.TestCase):
         self.assertEqual(metrics["taxonomy_count"], 1)
         self.assertEqual(metrics["inferred_count"], 2)
 
+
 class TestConfigValidation(LoggingTestCase):
     """Tests for configuration parameter validation and clamping."""
 
@@ -257,6 +254,7 @@ class TestConfigValidation(LoggingTestCase):
         finally:
             llm_client.load_parameters = original_load_parameters
             importlib.reload(stage_b_generation)
+
 
 class TestDroppingIrrelevantSkillsFlag(LoggingTestCase):
     """Tests for dropping_irrelevant_skills configuration flag."""
@@ -356,6 +354,7 @@ class TestDroppingIrrelevantSkillsFlag(LoggingTestCase):
         finally:
             stage_b_generation.dropping_irrelevant_skills = original_dropping
 
+
 class TestSkillsAliasMapLoading(LoggingTestCase):
     """Tests for _load_skills_alias_map file loading logic."""
 
@@ -388,6 +387,7 @@ class TestSkillsAliasMapLoading(LoggingTestCase):
         finally:
             stage_b_generation.load_yaml_dict = original_loader  # type: ignore[assignment]
             stage_b_generation._load_skills_alias_map.cache_clear()
+
 
 class TestSkillsMatchingEdgeCases(LoggingTestCase):
     """Tests for edge cases in canonical skill matching logic."""
@@ -494,6 +494,7 @@ class TestSkillsMatchingEdgeCases(LoggingTestCase):
             stage_b_generation.FUZZY_THRESHOLD = original_threshold
             stage_b_generation.MIN_SKILL_COVERAGE = original_cov
 
+
 class TestExperienceLLMFlow(LoggingTestCase):
     """Tests for LLM-based experience augmentation and bullets."""
 
@@ -548,7 +549,6 @@ class TestExperienceLLMFlow(LoggingTestCase):
 
         self.assertIn("Data Scientist", titles)
         self.assertIn("Lead AI Engineer", titles)
-
 
     def test_generate_experience_bullets_uses_llm_when_empty(self) -> None:
         """_generate_experience_bullets_for_item should call LLM when there are no usable responsibilities."""

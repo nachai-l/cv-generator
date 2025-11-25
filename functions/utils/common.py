@@ -399,6 +399,39 @@ def resolve_token_budget(section_id: str, attempt: int, params: dict) -> int | N
 
     return None
 
+def extract_loose_json_block(raw_output: str) -> str | None:
+    """
+    Attempt a weak extraction of a JSON-like block by finding the first '{'
+    and last '}'. This is a dangerous fallback and should only be used
+    when all strict methods have failed.
+
+    Returns:
+        The extracted substring, or None if insufficient structure.
+    """
+    if not raw_output:
+        return None
+
+    # Require at least one plausible JSON key before attempting
+    if "evidence_map" not in raw_output:
+        return None
+
+    first = raw_output.find("{")
+    last  = raw_output.rfind("}")
+
+    if first == -1 or last == -1 or last <= first:
+        return None
+
+    candidate = raw_output[first:last+1].strip()
+
+    # Basic sanity check
+    if len(candidate) < 10:
+        return None
+    if candidate.count("{") > 50:
+        # too messy, probably not a real JSON block; avoid errors
+        return None
+
+    return candidate
+
 # ---------------------------------------------------------------------------
 
 __all__ = [
@@ -415,4 +448,5 @@ __all__ = [
     "get_pricing_for_model",
     "get_thb_per_usd_from_params",
     "load_all_parameters",
+    "extract_loose_json_block",
 ]
