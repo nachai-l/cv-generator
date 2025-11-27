@@ -91,16 +91,16 @@ def compute_quality_metrics(
         and justification already populated.
     jd_required_skills:
         Optional list of required JD skills (canonical names). If not
-        provided or empty, jd_alignment_score will default to 0.0 and
-        feedback will indicate that JD context is missing.
-
-    Returns
-    -------
-    QualityMetrics
-        Pydantic model with individual scores + overall score + feedback.
+        provided or empty, jd_alignment_score will default to SCORE_MAX
+        (treated as neutral / best-case) and feedback will indicate that
+        JD context is missing.
     """
+
     clarity_score, clarity_feedback = _compute_clarity_score(response)
-    jd_score, jd_feedback = _compute_jd_alignment_score(response, jd_required_skills)
+    jd_score, jd_feedback, jd_missing_skills = _compute_jd_alignment_score(
+        response,
+        jd_required_skills,
+    )
     completeness_score, completeness_feedback = _compute_completeness_score(response)
     consistency_score, consistency_feedback = _compute_consistency_score(response)
 
@@ -131,6 +131,8 @@ def compute_quality_metrics(
         consistency_score=_round_score(consistency_score),
         overall_score=_round_score(overall_score),
         feedback=unique_feedback,
+        # 🔹 NEW: expose missing JD skills for Stage D to turn into suggestions
+        jd_missing_skills=list(jd_missing_skills or []),
     )
 
 
@@ -237,51 +239,76 @@ def _compute_clarity_score(
 def _compute_jd_alignment_score(
     response: CVGenerationResponse,
     jd_required_skills: Sequence[str] | None = None,
-) -> Tuple[float, list[str]]:
+) -> Tuple[float, list[str], list[str]]:
     """
     Heuristic JD alignment score.
 
+    Returns
+    -------
+    (score, feedback, jd_missing_skills)
+
     Logic:
-    - If jd_required_skills is None / empty → 0.0 with 'no JD context' feedback.
+    - If jd_required_skills is None / empty (after normalization) → treat as
+      "no JD context" and return SCORE_MAX with neutral feedback. We do not
+      penalize the CV when no target JD is available.
     - Otherwise, compute overlap between:
         - required JD skill names (normalized)
         - generated CV skills (response.skills + matched_jd_skills in sections)
+      and also return the list of required skills that are still missing.
     """
     feedback: list[str] = []
 
+    # No JD context → do NOT penalize; treat as neutral best-case.
     if not jd_required_skills:
-        return 0.0, [
-            "No job description skills provided – JD alignment score is not applicable (set to 0)."
-        ]
+        return SCORE_MAX, [
+            "No job description skills provided – JD alignment score treated as neutral (max)."
+        ], []
 
-    required_set = {s.strip().lower() for s in jd_required_skills if s.strip()}
-    if not required_set:
-        return 0.0, [
-            "Job description skills list was empty after normalization – JD alignment score set to 0."
-        ]
+    # Normalize required skills but keep original canonical names
+    normalized_required: list[tuple[str, str]] = []
+    for s in jd_required_skills:
+        if not s:
+            continue
+        canon = str(s).strip()
+        if not canon:
+            continue
+        normalized_required.append((canon.lower(), canon))
 
-    cv_skill_names: set[str] = set()
+    if not normalized_required:
+        return SCORE_MAX, [
+            "Job description skills list was empty after normalization – JD alignment score treated as neutral (max)."
+        ], []
+
+    required_lower_set = {lower for (lower, _canon) in normalized_required}
+
+    cv_skill_names_lower: set[str] = set()
 
     # From structured skills
     if response.skills:
         for item in response.skills:
             if item.name:
-                cv_skill_names.add(item.name.strip().lower())
+                cv_skill_names_lower.add(item.name.strip().lower())
 
     # From section-level matched_jd_skills
     for section in response.sections.values():
         for skill in section.matched_jd_skills:
             if skill:
-                cv_skill_names.add(skill.strip().lower())
+                cv_skill_names_lower.add(skill.strip().lower())
 
-    if not cv_skill_names:
+    if not cv_skill_names_lower:
         feedback.append(
             "No skills were identified in the generated CV – JD alignment score is low."
         )
 
-    intersection = required_set.intersection(cv_skill_names)
-    coverage_ratio = len(intersection) / len(required_set)
+    intersection_lower = required_lower_set.intersection(cv_skill_names_lower)
+    coverage_ratio = len(intersection_lower) / len(required_lower_set)
     score = coverage_ratio * SCORE_MAX
+
+    # Compute missing skills in original canonical form
+    missing_lower = required_lower_set.difference(intersection_lower)
+    jd_missing_skills: list[str] = [
+        canon for (lower, canon) in normalized_required if lower in missing_lower
+    ]
 
     if score == 0.0:
         feedback.append(
@@ -299,7 +326,7 @@ def _compute_jd_alignment_score(
         feedback.append("Generated CV aligns well with the job description skills.")
 
     score = _clamp_score(score)
-    return score, feedback
+    return score, feedback, jd_missing_skills
 
 
 # ---------------------------------------------------------------------------

@@ -129,6 +129,47 @@ def _to_serializable(value: Any) -> Any:
     except TypeError:
         return str(value)
 
+def _resolve_job_context_for_prompts(
+    request: CVGenerationRequest | Any,
+) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    """
+    Resolve job/role/company context for prompts in a backward-compatible way.
+
+    Priority:
+    1) Legacy fields: job_role_info, job_position_info, company_info
+    2) New API fields: target_role_taxonomy, target_jd_taxonomy
+       - If company_info is missing, try to derive it from target_jd_taxonomy.
+    """
+    # Legacy-style fields
+    raw_job_role_info = getattr(request, "job_role_info", None)
+    raw_job_position_info = getattr(request, "job_position_info", None)
+    raw_company_info = getattr(request, "company_info", None)
+
+    # New API fields (CVGenerationRequest)
+    target_role = getattr(request, "target_role_taxonomy", None)
+    target_jd = getattr(request, "target_jd_taxonomy", None)
+
+    # Prefer legacy if present; otherwise fall back to new API
+    job_role_obj = raw_job_role_info or target_role or {}
+    job_position_obj = raw_job_position_info or target_jd or {}
+
+    # Company: prefer explicit company_info, otherwise try to derive from JD
+    company_obj = raw_company_info
+    if not company_obj and target_jd is not None:
+        company_obj = (
+            getattr(target_jd, "company_info", None)
+            or getattr(target_jd, "company", None)
+            or getattr(target_jd, "employer", None)
+            or getattr(target_jd, "organization", None)
+        )
+
+    # Ensure JSON-serializable outputs
+    job_role_info = _to_serializable(job_role_obj) or {}
+    job_position_info = _to_serializable(job_position_obj) or {}
+    company_info = _to_serializable(company_obj) or {}
+
+    return job_role_info, job_position_info, company_info
+
 
 def _normalize_section_id_for_evidence(section_id: str) -> str:
     """Map internal/derived section IDs to their canonical evidence section name.
@@ -356,15 +397,10 @@ def build_section_prompt(
         # New API shape: fall back to student_profile
         raw_profile_info = getattr(request, "student_profile", None) or {}
 
-    raw_job_role_info = getattr(request, "job_role_info", None) or {}
-    raw_job_position_info = getattr(request, "job_position_info", None) or {}
-    raw_company_info = getattr(request, "company_info", None) or {}
     drafts = getattr(request, "user_input_cv_text_by_section", {}) or {}
 
     profile_info = _to_serializable(raw_profile_info)
-    job_role_info = _to_serializable(raw_job_role_info)
-    job_position_info = _to_serializable(raw_job_position_info)
-    company_info = _to_serializable(raw_company_info)
+    job_role_info, job_position_info, company_info = _resolve_job_context_for_prompts(request)
 
     user_draft = drafts.get(section_id)
 
@@ -531,14 +567,8 @@ def build_skills_selection_prompt(
     if not raw_profile_info:
         raw_profile_info = getattr(request, "student_profile", None) or {}
 
-    raw_job_role_info = getattr(request, "job_role_info", None) or {}
-    raw_job_position_info = getattr(request, "job_position_info", None) or {}
-    raw_company_info = getattr(request, "company_info", None) or {}
-
     profile_info = _to_serializable(raw_profile_info)
-    job_role_info = _to_serializable(raw_job_role_info)
-    job_position_info = _to_serializable(raw_job_position_info)
-    company_info = _to_serializable(raw_company_info)
+    job_role_info, job_position_info, company_info = _resolve_job_context_for_prompts(request)
 
     lines: List[str] = [
         f"The CV language is {language_name} (language_code='{language_code}').",
@@ -592,6 +622,7 @@ def build_experience_justification_prompt(
     Used for:
       - final 'experience'
       - 'experience_bullets_only' justification
+
     Always outputs JSON-only (no section text, no separators).
     """
     prompts_cfg: dict[str, str] = _load_prompts_from_file()
@@ -605,14 +636,6 @@ def build_experience_justification_prompt(
     if not raw_profile_info:
         raw_profile_info = getattr(request, "student_profile", None) or {}
     profile_info = _to_serializable(raw_profile_info)
-
-    raw_job_role_info = getattr(request, "job_role_info", None) or {}
-    raw_job_position_info = getattr(request, "job_position_info", None) or {}
-    raw_company_info = getattr(request, "company_info", None) or {}
-
-    job_role_info = _to_serializable(raw_job_role_info)
-    job_position_info = _to_serializable(raw_job_position_info)
-    company_info = _to_serializable(raw_company_info)
 
     # Use section_id so we can justify 'experience' or 'experience_bullets_only'
     evidence_facts = _collect_evidence_facts_for_section(evidence_plan, section_id)
@@ -666,22 +689,11 @@ STRICT RULES:
         "You are an assistant that produces JSON justifications for a CV section.",
         f"The CV language is {language_name} (language_code='{language}').",
         "",
-        "Use the profile info, job context, and evidence facts to justify the claims",
+        "Use the profile info and evidence facts to justify the claims",
         f"in the final '{section_label}' section text.",
         "",
         "=== Profile Info (JSON) ===",
         json.dumps(profile_info, ensure_ascii=False, indent=2),
-        "",
-        "=== Target Job Role / Position / Company (JSON) ===",
-        json.dumps(
-            {
-                "job_role_info": job_role_info,
-                "job_position_info": job_position_info,
-                "company_info": company_info,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
         "",
         f"=== Evidence Facts for {section_label} ===",
     ]
@@ -703,4 +715,129 @@ STRICT RULES:
     )
 
     return "\n".join(lines)
+
+
+# def build_experience_justification_prompt(
+#     request: CVGenerationRequest,
+#     evidence_plan: EvidencePlan | None,
+#     section_text: str,
+#     section_id: str = "experience",
+# ) -> str:
+#     """
+#     Build a justification-only prompt for experience sections.
+#
+#     Used for:
+#       - final 'experience'
+#       - 'experience_bullets_only' justification
+#     Always outputs JSON-only (no section text, no separators).
+#     """
+#     prompts_cfg: dict[str, str] = _load_prompts_from_file()
+#
+#     raw_language = getattr(request, "language", "en") or "en"
+#     language = raw_language
+#     language_name = describe_language(language)
+#
+#     # Prefer profile_info; fall back to student_profile
+#     raw_profile_info = getattr(request, "profile_info", None)
+#     if not raw_profile_info:
+#         raw_profile_info = getattr(request, "student_profile", None) or {}
+#     profile_info = _to_serializable(raw_profile_info)
+#
+#     raw_job_role_info = getattr(request, "job_role_info", None) or {}
+#     raw_job_position_info = getattr(request, "job_position_info", None) or {}
+#     raw_company_info = getattr(request, "company_info", None) or {}
+#
+#     job_role_info = _to_serializable(raw_job_role_info)
+#     job_position_info = _to_serializable(raw_job_position_info)
+#     company_info = _to_serializable(raw_company_info)
+#
+#     # Use section_id so we can justify 'experience' or 'experience_bullets_only'
+#     evidence_facts = _collect_evidence_facts_for_section(evidence_plan, section_id)
+#
+#     # Prefer JSON-only justification prompts from prompts.yaml
+#     justification_instructions = (
+#         prompts_cfg.get("experience_justification_json_only", "").strip()
+#         or prompts_cfg.get("justification_json_only", "").strip()
+#     )
+#
+#     # If still empty, fall back to a built-in JSON-only specification
+#     if not justification_instructions:
+#         justification_instructions = """
+# You must output ONLY a single valid JSON object with this structure:
+#
+# {
+#   "evidence_map": [
+#     {
+#       "section": "<SECTION_ID>",
+#       "sentence": "<full sentence copied exactly from the generated section text>",
+#       "evidence_ids": ["<evidence_ref_1>", "<evidence_ref_2>"],
+#       "match_score": <float between 0.0 and 1.0>
+#     }
+#   ],
+#   "unsupported_claims": [
+#     {
+#       "section": "<SECTION_ID>",
+#       "claim": "<claim that is unsupported>",
+#       "reason": "<explanation>",
+#       "severity": "info" | "warning" | "error"
+#     }
+#   ],
+#   "coverage_score": <float between 0.0 and 1.0>,
+#   "total_claims_analyzed": <integer >= 0>
+# }
+#
+# STRICT RULES:
+# - Output ONLY JSON (no prose, no section text).
+# - Do NOT output any separator like "=== JUSTIFICATION_JSON ===".
+# - Do NOT wrap JSON in backticks or code fences.
+# - Allowed keys: evidence_map, unsupported_claims, coverage_score, total_claims_analyzed.
+# - If unsure about any field, use null.
+# """.strip()
+#
+#     # Human-friendly label
+#     section_label = (
+#         "experience" if section_id == "experience" else section_id.replace("_", " ")
+#     )
+#
+#     lines: list[str] = [
+#         "You are an assistant that produces JSON justifications for a CV section.",
+#         f"The CV language is {language_name} (language_code='{language}').",
+#         "",
+#         "Use the profile info, job context, and evidence facts to justify the claims",
+#         f"in the final '{section_label}' section text.",
+#         "",
+#         "=== Profile Info (JSON) ===",
+#         json.dumps(profile_info, ensure_ascii=False, indent=2),
+#         "",
+#         "=== Target Job Role / Position / Company (JSON) ===",
+#         json.dumps(
+#             {
+#                 "job_role_info": job_role_info,
+#                 "job_position_info": job_position_info,
+#                 "company_info": company_info,
+#             },
+#             ensure_ascii=False,
+#             indent=2,
+#         ),
+#         "",
+#         f"=== Evidence Facts for {section_label} ===",
+#     ]
+#
+#     if evidence_facts:
+#         lines.extend([f"- {fact}" for fact in evidence_facts])
+#     else:
+#         lines.append("- (No specific evidence provided)")
+#
+#     lines.extend(
+#         [
+#             "",
+#             f"=== Final rendered '{section_label}' section text ===",
+#             section_text,
+#             "",
+#             "=== Justification Instructions ===",
+#             justification_instructions,
+#         ]
+#     )
+#
+#     return "\n".join(lines)
 

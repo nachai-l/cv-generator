@@ -33,7 +33,10 @@ class SectionContent(BaseModel):
     word_count: int = Field(..., ge=0, description="Number of words in the text")
     matched_jd_skills: list[str] = Field(
         default_factory=list,
-        description="Skills from job description that appear in this section",
+        description=(
+            "Canonical JD skills that were deterministically matched in this "
+            "section's text (Stage C/D, via jd_matching.annotate_matched_jd_skills)."
+        ),
     )
     confidence_score: float = Field(
         default=1.0,
@@ -236,45 +239,6 @@ class QualityMetrics(BaseModel):
         default=0.0,
         ge=0.0,
         le=100.0,
-        description="Readability/clarity score (0-100)",
-    )
-    jd_alignment_score: float = Field(
-        default=0.0,
-        ge=0.0,
-        le=100.0,
-        description="Alignment with job description (0-100)",
-    )
-    completeness_score: float = Field(
-        default=0.0,
-        ge=0.0,
-        le=100.0,
-        description="How complete the CV is (0-100)",
-    )
-    consistency_score: float = Field(
-        default=0.0,
-        ge=0.0,
-        le=100.0,
-        description="Internal consistency (0-100)",
-    )
-    overall_score: float = Field(
-        default=0.0,
-        ge=0.0,
-        le=100.0,
-        description="Overall quality score (0-100)",
-    )
-    feedback: list[str] = Field(
-        default_factory=list, description="Specific quality feedback items"
-    )
-
-    model_config = {"extra": "forbid"}
-
-class QualityMetrics(BaseModel):
-    """Quality assessment metrics for generated CV."""
-
-    clarity_score: float = Field(
-        default=0.0,
-        ge=0.0,
-        le=100.0,
         description="Readability / clarity score (0-100)",
     )
     jd_alignment_score: float = Field(
@@ -306,6 +270,9 @@ class QualityMetrics(BaseModel):
         default_factory=list,
         description="List of feedback items describing strengths or issues",
     )
+
+    # 🔹 NEW: structured info about JD coverage
+    jd_missing_skills: list[str] = []
 
     model_config = {"extra": "forbid"}
 

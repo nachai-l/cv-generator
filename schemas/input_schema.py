@@ -399,7 +399,6 @@ class UserInputCVTextBySection(BaseModel):
     # Allows only known keys; prevents user sending arbitrary dicts.
     model_config = {"extra": "forbid"}
 
-
 class CVGenerationRequest(BaseModel):
     """Top-level CV generation request payload.
 
@@ -413,6 +412,7 @@ class CVGenerationRequest(BaseModel):
     - `student_profile`: ground-truth data for the student
     - `target_role_taxonomy`: optional generic role context
     - `target_jd_taxonomy`: normalized target job / JD information
+    - `jd_required_skills`: optional canonical JD skills list (names only)
 
     Design goals:
     - Safe by default: no extra fields, bounded list sizes
@@ -463,6 +463,9 @@ class CVGenerationRequest(BaseModel):
     target_role_taxonomy: RoleTaxonomy | None = None
     # Optional context for this generation request (normalized JD)
     target_jd_taxonomy: JobTaxonomy | None = None
+    # Optional canonical JD skills list (names only, e.g. ["Python", "Leadership"])
+    # If None, downstream stages may derive it from role/JD taxonomy.
+    jd_required_skills: list[str] | None = None
 
     # Reject unexpected fields at the top-level request
     model_config = {"extra": "forbid"}

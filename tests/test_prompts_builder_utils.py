@@ -32,8 +32,8 @@ Core responsibilities covered:
 
 - build_experience_justification_prompt:
     - Builds a justification-only prompt for the final experience section text.
-    - Includes profile info, job context, evidence facts, and justification
-      instructions from prompts.yaml.
+    - Includes profile info, evidence facts, and justification instructions
+      from prompts.yaml.
 """
 
 from __future__ import annotations
@@ -496,19 +496,20 @@ class TestBuildExperienceJustificationPrompt(LoggingTestCase):
 
     @patch("functions.utils.prompts_builder.load_yaml_dict")
     def test_builds_experience_justification_with_all_blocks(
-        self,
-        mock_load_yaml,
+            self,
+            mock_load_yaml,
     ) -> None:
         """
         build_experience_justification_prompt should:
         - include language
-        - include profile info + job context JSON
+        - include profile info JSON
         - include evidence facts
         - include final rendered experience text
         - include justification instructions from prompts.yaml
         """
         mock_load_yaml.return_value = {
-            "justification": "Return JUSTIFICATION_JSON with evidence_map.",
+            # Use the key actually read by build_experience_justification_prompt
+            "experience_justification_json_only": "Return JUSTIFICATION_JSON with evidence_map.",
         }
         _load_prompts_from_file.cache_clear()
 
@@ -541,13 +542,11 @@ class TestBuildExperienceJustificationPrompt(LoggingTestCase):
         self.assertIn("You are an assistant that produces JSON justifications", prompt)
         self.assertIn("The CV language is", prompt)
 
-        # Profile info + job context
+        # Profile info (no longer job context block)
         self.assertIn("=== Profile Info (JSON) ===", prompt)
         self.assertIn('"experience": [', prompt)
         self.assertIn('"role-1"', prompt)
         self.assertIn('"role-2"', prompt)
-        self.assertIn("=== Target Job Role / Position / Company (JSON) ===", prompt)
-        self.assertIn('"title": "Senior Data Scientist"', prompt)
 
         # Evidence facts
         self.assertIn("=== Evidence Facts for experience ===", prompt)
@@ -558,7 +557,7 @@ class TestBuildExperienceJustificationPrompt(LoggingTestCase):
         self.assertIn("=== Final rendered 'experience' section text ===", prompt)
         self.assertIn("- Led X", prompt)
 
-        # Justification instructions
+        # Justification instructions (from prompts.yaml key we mocked)
         self.assertIn("=== Justification Instructions ===", prompt)
         self.assertIn("Return JUSTIFICATION_JSON with evidence_map.", prompt)
 

@@ -182,7 +182,7 @@ class TestQualityMetricsBasic(PrettyTestCase):
         self.assertGreater(metrics.overall_score, 50.0)
 
     def test_no_jd_skills(self):
-        """If JD skills = None, JD alignment score should be 0."""
+        """If JD skills = None, JD alignment score should be max (neutral)."""
         sections = {
             "profile_summary": _make_section("Short CV example text."),
             "skills": _make_section("Python, AI, Data Science."),
@@ -198,9 +198,10 @@ class TestQualityMetricsBasic(PrettyTestCase):
             f"feedback={metrics.feedback}"
         )
 
-        self.assertEqual(metrics.jd_alignment_score, 0.0)
+        # With no JD context, we treat JD alignment as neutral best-case.
+        self.assertEqual(metrics.jd_alignment_score, 100.0)
         self.assertTrue(
-            any("not applicable" in f.lower() for f in metrics.feedback)
+            any("neutral" in f.lower() for f in metrics.feedback)
         )
 
     def test_low_completeness_missing_sections(self):
