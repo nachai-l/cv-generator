@@ -19,6 +19,11 @@ Covered here:
     - When justification is required, and split_section_and_justification
       returns a JSON tail, the final CVGenerationResponse.justification
       is populated with a Justification model derived from that JSON.
+
+- safe_truncate.smart_truncate_markdown:
+    - Never truncates JSON-like sections (JSON protection).
+    - Applies markdown-aware truncation for normal text with sentence
+      boundaries and conservative cleanup.
 """
 
 from __future__ import annotations
@@ -29,8 +34,26 @@ from typing import Any, Dict
 import functions.stage_b_generation as stage_b_generation
 import functions.utils.prompts_builder as prompts_builder
 from functions.stage_b_generation import CVGenerationEngine
-from .test_stage_b_generation import LoggingTestCase  # reuse logging style
 from schemas.output_schema import Justification
+from functions.utils.safe_truncate import smart_truncate_markdown, is_json_block
+
+
+class LoggingTestCase(unittest.TestCase):
+    """
+    Minimal logging-aware base test case.
+
+    We keep this simple here to avoid importing test_stage_b_generation,
+    which still depends on legacy _truncate_text. If you later want full
+    log-capture behaviour, you can mirror the implementation from
+    test_stage_b_generation, but this lightweight stub is sufficient
+    for the current tests.
+    """
+
+    def setUp(self) -> None:  # noqa: D401
+        super().setUp()
+
+    def tearDown(self) -> None:  # noqa: D401
+        super().tearDown()
 
 
 class _SimpleTemplateInfo:
@@ -635,6 +658,68 @@ class TestJustificationAggregationAcrossSections(LoggingTestCase):
         self.assertIn("skills", sections_in_evidence)
         # And we expect at least 2 entries total (no overwrite)
         self.assertGreaterEqual(len(sections_in_evidence), 2)
+
+
+# ---------------------------------------------------------------------------
+# Tests for smart_truncate_markdown / JSON protection
+# ---------------------------------------------------------------------------
+
+
+class TestSmartTruncateMarkdownJSONProtection(LoggingTestCase):
+    """Unit tests for smart_truncate_markdown + is_json_block behaviour."""
+
+    def test_is_json_block_by_section_hint(self) -> None:
+        """Section IDs with JSON hints should be classified as JSON blocks."""
+        text = '{"foo": 1, "bar": 2}'
+        self.assertTrue(is_json_block(text, section_id="skills_structured"))
+        self.assertTrue(is_json_block(text, section_id="profile_summary_justification"))
+
+    def test_smart_truncate_never_truncates_json(self) -> None:
+        """For JSON-like text, smart_truncate_markdown must not truncate."""
+        long_json = (
+            '{"foo": 1, "bar": 2, "items": [{"a": 1}, {"b": 2}], '
+            '"nested": {"x": 10, "y": 20}}'
+        )
+        max_len = 10  # deliberately smaller than len(long_json)
+
+        result = smart_truncate_markdown(
+            text=long_json,
+            max_len=max_len,
+            lang="en",
+            section_id="skills_structured",
+        )
+
+        self.assertFalse(result["truncation_applied"])
+        self.assertEqual(result["strategy_used"], "no_truncation_json")
+        self.assertEqual(result["safe_text"], long_json)
+
+    def test_smart_truncate_plain_markdown_truncates_within_overflow(self) -> None:
+        """Plain markdown should be truncated but allowed to overflow slightly."""
+        # A couple of short sentences so sentence-based truncation is used.
+        text = (
+            "This is a long summary sentence that should be truncated. "
+            "Here is another sentence to make sure we go over the limit. "
+            "Final short sentence."
+        )
+        max_len = 80
+        result = smart_truncate_markdown(
+            text=text,
+            max_len=max_len,
+            lang="en",
+            section_id="profile_summary",
+        )
+
+        self.assertTrue(result["truncation_applied"])
+        safe = result["safe_text"]
+        # Length must not exceed max_len + default overflow (128)
+        self.assertLessEqual(len(safe), max_len + 128)
+        # Should never be longer than the original
+        self.assertLessEqual(len(safe), len(text))
+        # Typically, for this test, we at least expect it to be reasonably close
+        # to the original and not a tiny fragment.
+        self.assertGreaterEqual(len(safe), max_len)
+        # Should not end in clearly broken markdown artifacts
+        self.assertFalse(safe.rstrip().endswith(("!", "[", "(", "`")))
 
 
 if __name__ == "__main__":

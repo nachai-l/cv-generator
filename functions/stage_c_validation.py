@@ -311,6 +311,18 @@ def run_stage_c_validation(
         num_sections=len(resp.sections or {}),
         num_skills=len(resp.skills or []) if getattr(resp, "skills", None) else 0,
     )
+    # ----------------------------------------------------------------------
+    # JD Skill Matching (deterministic, non-mutating to text or skills list)
+    # ----------------------------------------------------------------------
+    try:
+        from functions.utils.jd_matching import (
+            extract_canonical_jd_required_skills,
+            annotate_matched_jd_skills,
+        )
+        jd_required = extract_canonical_jd_required_skills(original_request)
+        resp = annotate_matched_jd_skills(resp, jd_required_skills=jd_required)
+    except Exception as e:
+        logger.warning("stage_c_jd_matching_failed", error=str(e))
 
     return resp
 

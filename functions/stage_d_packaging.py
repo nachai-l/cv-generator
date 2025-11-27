@@ -10,7 +10,8 @@ Responsibilities:
 - Enrich metadata with timing, token usage, cost, and profile header info.
 - Attach / propagate request_id and user_id for observability.
 - Mark pipeline completion flags (e.g., stage_d_completed) without mutating
-  sections or skills that were already finalized in Stage C.
+  sections or skills that were already finalized in Stage C (aside from
+  deterministic JD-skill annotations).
 - Normalize and construct error responses (ErrorResponse) in a way that is
   HTTP-agnostic so FastAPI (or any other framework) can use it directly.
 """
@@ -28,8 +29,14 @@ from schemas.output_schema import (
     ErrorResponse,
     GenerationStatus,
 )
-from functions.utils.quality_metrics import compute_quality_metrics
 from schemas.output_schema import QualityMetrics, ValidationWarning
+from functions.utils.quality_metrics import compute_quality_metrics
+
+# 🔹 NEW: deterministic JD-skill matching
+from functions.utils.jd_matching import (
+    extract_canonical_jd_required_skills,
+    annotate_matched_jd_skills,
+)
 
 logger = structlog.get_logger(__name__).bind(module="stage_d_packaging")
 
@@ -56,6 +63,7 @@ class LLMUsageSummary:
     total_cost_thb: float = 0.0
     total_cost_usd: float = 0.0
     section_breakdown: Optional[list[dict[str, Any]]] = None
+
 
 # ---------------------------------------------------------------------------
 # Core packaging helpers
@@ -99,6 +107,10 @@ def finalize_cv_response(
     total_cost_usd: Optional[float] = None,
     generation_start: Optional[datetime] = None,
     generation_end: Optional[datetime] = None,
+    # 🔹 NEW (backwards-compatible): allow Stage D to see the original request
+    original_request: Optional[Any] = None,
+    # 🔹 NEW (optional override): pass canonical JD skills directly if already computed
+    jd_required_skills: Optional[list[str]] = None,
 ) -> Tuple[CVGenerationResponse, str]:
     """
     Finalize and enrich a successful CVGenerationResponse for delivery.
@@ -111,12 +123,17 @@ def finalize_cv_response(
       from LLMUsageSummary or explicit primitives.
     - Optionally injects profile_info into metadata.profile_info for renderer.
     - Recomputes sections_generated if needed for consistency.
+    - Runs deterministic JD-skill matching to populate section.matched_jd_skills
+      when JD skills are available.
+    - Computes quality metrics (including JD alignment).
     - Marks metadata.stage_d_completed=True (best-effort).
     - Logs a summary event for observability.
 
     NOTE:
       Stage D MUST NOT modify sections or skills content; Stage C is the
-      last stage allowed to change text or skills.
+      last stage allowed to change text or skills. The only mutation here is
+      to `section.matched_jd_skills`, which is purely a deterministic
+      annotation based on JD skills.
     """
     # Ensure we have a request_id for logging and headers.
     req_id = request_id or _generate_request_id()
@@ -183,7 +200,7 @@ def finalize_cv_response(
             except Exception:
                 pass
 
-            # Ppass section breakdown from Stage B → Stage D → Metadata
+            # Pass section breakdown from Stage B → Stage D → Metadata
             try:
                 if getattr(llm_usage, "section_breakdown", None):
                     meta.section_breakdown = llm_usage.section_breakdown
@@ -196,13 +213,13 @@ def finalize_cv_response(
                 if llm_usage.model not in ("", "unknown"):
                     meta.model_version = llm_usage.model
 
-            # ---- NEW OPTIONAL POLISH ----
+            # ---- OPTIONAL POLISH ----
             # Fill in detailed usage breakdown
             setattr(meta, "llm_model", llm_usage.model)
             setattr(meta, "llm_prompt_tokens", llm_usage.prompt_tokens)
             setattr(meta, "llm_completion_tokens", llm_usage.completion_tokens)
             setattr(meta, "llm_total_tokens", llm_usage.total_tokens)
-            # --------------------------------
+            # -------------------------
 
         except Exception:
             # Metadata best-effort; never break Stage D
@@ -220,31 +237,81 @@ def finalize_cv_response(
         except Exception:
             pass
 
+        # -------------------------------------------------------------------
+        # 🔹 Deterministic JD-skill matching (fills section.matched_jd_skills)
+        # -------------------------------------------------------------------
+        try:
+            # Prefer explicitly provided *non-empty* jd_required_skills.
+            # If it's empty/None, fall back to extracting from original_request.
+            if jd_required_skills:
+                canonical_jd_skills = [
+                    str(s).strip()
+                    for s in jd_required_skills
+                    if s and str(s).strip()
+                ]
+                jd_source = "explicit"
+            elif original_request is not None:
+                canonical_jd_skills = extract_canonical_jd_required_skills(original_request)
+                jd_source = "original_request"
+            else:
+                canonical_jd_skills = []
+                jd_source = "none"
+
+            # Only annotate if we actually have JD skills.
+            if canonical_jd_skills:
+                cv = annotate_matched_jd_skills(
+                    cv,
+                    jd_required_skills=canonical_jd_skills,
+                )
+
+            logger.info(
+                "stage_d_jd_required_skills_resolved",
+                source=jd_source,
+                count=len(canonical_jd_skills),
+                skills=canonical_jd_skills[:20],  # avoid log spam
+            )
+
+        except Exception as e:
+            logger.exception("stage_d_jd_matching_failed", error=str(e))
+            canonical_jd_skills = []
+
+        # Mark Stage D completion flag
         meta.stage_d_completed = True
 
-        # -----------------------------------------------------------------------
+        # -------------------------------------------------------------------
         # Compute Quality Metrics (Clarity, JD alignment, completeness, etc.)
-        # -----------------------------------------------------------------------
+        # -------------------------------------------------------------------
         try:
-            # The orchestrator or request may provide a list of JD-required skills.
-            # If absent, pass empty list – compute_quality_metrics handles it gracefully.
-            jd_required_skills = []
-
             # cv.quality_metrics is optional; always compute a fresh one here.
             qm: QualityMetrics = compute_quality_metrics(
                 cv,
-                jd_required_skills=jd_required_skills,
+                jd_required_skills=canonical_jd_skills,
             )
             cv.quality_metrics = qm
 
             # Convert quality-metrics feedback into ValidationWarning objects
             for fb in qm.feedback:
+                suggestion: str | None = None
+
+                # 🔹 If JD skills are partially missing, surface them as a suggestion
+                if (
+                        "Some required JD skills appear in the CV, but important skills are still missing."
+                        in fb
+                        and getattr(qm, "jd_missing_skills", None)
+                ):
+                    missing_list = [s for s in qm.jd_missing_skills if s and str(s).strip()]
+                    if missing_list:
+                        suggestion = (
+                                "Consider adding or emphasizing these JD skills in your CV: "
+                                + ", ".join(missing_list)
+                        )
+
                 cv.warnings.append(
                     ValidationWarning(
                         section="quality_metrics",
                         warning_type="quality_feedback",
                         message=fb,
-                        suggestion=None,
+                        suggestion=suggestion,
                     )
                 )
 
@@ -282,7 +349,6 @@ def finalize_cv_response(
         # Pull fine-grained tokens for logging
         input_tokens = getattr(meta, "input_tokens", None) if meta is not None else None
         output_tokens = getattr(meta, "output_tokens", None) if meta is not None else None
-
 
         logger.info(
             "cv_generation_packaged",

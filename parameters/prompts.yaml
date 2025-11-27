@@ -45,17 +45,54 @@ skills: |
   Write the skills section as a concise bulleted list.
   Group related skills together where appropriate (e.g. Programming, Data, Tools).
   Each bullet should start with "- " and list a short set of skills separated by commas.
+
+  You will see profile information, experience, and education. Sometimes you may
+  also see job/role context (target role taxonomy or job description). When job/role
+  context is available, use it to prioritize which skills to highlight.
+
+  When choosing which skills to include:
+    - Give clear priority to skills that match or closely paraphrase REQUIRED SKILLS
+      from the target role and job description, **when such information is present**.
+    - Only include a required skill if it is explicitly mentioned or strongly implied
+      by the profile, experience, education, or evidence facts.
+    - If the profile already shows an equivalent concept (e.g. "fermentation process
+      optimization" vs "bioprocess optimization"), you may prefer the required-skill
+      wording as long as it is faithful to the evidence.
+
   Focus on skills that are clearly supported by the profile and evidence.
   Do not invent unrelated skills or tools that are not implied by the profile.
   Do not add headings or subheadings; only bullets.
 
+
 skills_structured: |
   You will generate a structured list of skills for this CV.
+
+  You will always see:
+    - Canonical skills (with levels) from the profile/taxonomy.
+    - Profile, experience, education, and evidence facts.
+  In some cases, you may also see:
+    - REQUIRED SKILLS from a target role and job description (job/role context).
+
   Use the canonical skills (with levels) as the primary source of truth.
   You may:
     - keep canonical skills as-is,
     - drop clearly irrelevant skills,
     - add new skills that are strongly implied by the profile and evidence.
+
+  REQUIRED SKILLS HANDLING (only when job/role context is available):
+    - Treat the required skills from the role and job description as high-priority candidates.
+    - For each required skill, check whether the profile, experience, education,
+      or evidence facts explicitly mention it OR clearly imply it.
+    - If it is supported (directly or via a very close synonym), you SHOULD include
+      a skill item that matches or closely paraphrases the required skill name.
+    - If it is NOT supported, do NOT add it just because it appears in the required list.
+
+  Synonyms and phrasing:
+    - If a canonical skill is essentially the same as a required skill, keep the canonical
+      name and rely on justification/evidence to show that it satisfies the requirement.
+    - Example: "Fermentation process optimization" can satisfy "Bioprocess optimization"
+      if the profile clearly supports it.
+
   Every skill must be backed by the profile, experience, or education; do not hallucinate.
 
   IMPORTANT OUTPUT REQUIREMENTS:
@@ -72,13 +109,16 @@ skills_structured: |
         { "name": "...", "level": "...", "source": "..." },
         ...
       ]
-  - For each item:
-      - name:   a short, human-readable skill name in the target language.
-      - level:  a simple textual level such as "Beginner", "Intermediate", "Advanced",
-                or reuse the level labels provided by the canonical skills.
-      - source: "taxonomy" for canonical skills, "inferred" for newly inferred skills.
+
+  For each item:
+    - name:   a short, human-readable skill name in the target language.
+    - level:  a simple textual level such as "Beginner", "Intermediate", "Advanced",
+              or reuse the level labels provided by the canonical skills.
+    - source: "taxonomy" for canonical skills, "inferred" for newly inferred skills
+              (including required skills that were not in the canonical list).
 
   Do NOT include any explanatory prose in the JSON.
+
 
 # -------------------------------------------------------------------
 # Experience: style guide + bullets-only generator

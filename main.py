@@ -176,10 +176,12 @@ def run_cv_generation(
         request_id=request_id,
         user_id=user_id,
         profile_info=profile_info_dict,
-        llm_usage=llm_usage,  # <—— ADD THIS
+        llm_usage=llm_usage,
         generation_start=generation_start,
         generation_end=generation_end,
+        original_request=request,
     )
+
 
     logger.info("stage_d_packaging_done", request_id=final_request_id)
 

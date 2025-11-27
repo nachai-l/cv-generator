@@ -87,8 +87,14 @@ from functions.utils.skills_formatting import (
     parse_skills_from_bullets,
     is_combined_canonical_name,
     match_canonical_skill,
-    compute_section_matched_jd_skills,
+    # compute_section_matched_jd_skills,
 )
+
+from functions.utils.jd_matching import (
+    extract_canonical_jd_required_skills,
+    annotate_matched_jd_skills,
+)
+
 from functions.utils.experience_functions import (
     ExperienceItem,
     extract_year_from_date,
@@ -302,49 +308,6 @@ def _render_experience_header(entry: Any) -> str:
     as `render_experience_header`.
     """
     return render_experience_header(entry)
-
-
-def _extract_jd_target_skills(request: CVGenerationRequest) -> set[str]:
-    """
-    Collect target JD skills from job_role_info / job_position_info, if present.
-
-    Expected shapes (examples only):
-      job_role_info.required_skills: list[str] or list[{"name": str, ...}]
-      job_position_info.required_skills: same idea.
-
-    Returns:
-        set[str]: normalized (lowercased) skill names.
-    """
-
-    def _names_from_list(raw: Any) -> set[str]:
-        out: set[str] = set()
-        if not raw:
-            return out
-        for item in raw:
-            if isinstance(item, str):
-                name = item.strip()
-            elif isinstance(item, dict):
-                name = str(item.get("name", "")).strip()
-            else:
-                name = str(item).strip()
-            if name:
-                out.add(name.lower())
-        return out
-
-    jd_skills: set[str] = set()
-
-    job_role_info = getattr(request, "job_role_info", None) or {}
-    job_position_info = getattr(request, "job_position_info", None) or {}
-
-    for src in (job_role_info, job_position_info):
-        if not isinstance(src, dict):
-            continue
-        for key in ("required_skills", "preferred_skills", "skills"):
-            if key in src:
-                jd_skills |= _names_from_list(src.get(key))
-
-    logger.info("jd_target_skills_extracted", count=len(jd_skills))
-    return jd_skills
 
 
 BAD_SECTION_HEADINGS = (
@@ -566,110 +529,6 @@ def _get_section_char_limits(request: CVGenerationRequest) -> Dict[str, int]:
     if not tmpl or not getattr(tmpl, "max_chars_per_section", None):
         return {}
     return dict(tmpl.max_chars_per_section)
-
-
-# ---------------------------------------------------------------------------
-# Education section local helper
-# ---------------------------------------------------------------------------
-
-
-# def _format_education_fact_entry(entry: Any) -> str | None:
-#     """Format a single education entry into a concise fact string.
-#
-#     Supports:
-#     - object-like entries (attrs: degree, institution, major, gpa, start_date, graduation_date)
-#     - dict-like entries with the same keys
-#     - plain strings (returned as-is)
-#     """
-#     if isinstance(entry, str):
-#         val = entry.strip()
-#         return val or None
-#
-#     # Attribute or dict access helpers
-#     def _get(attr: str) -> Any:
-#         if hasattr(entry, attr):
-#             return getattr(entry, attr)
-#         if isinstance(entry, dict):
-#             return entry.get(attr)
-#         return None
-#
-#     degree = _get("degree")
-#     institution = _get("institution")
-#     major = _get("major")
-#     gpa = _get("gpa")
-#     honors = _get("honors")
-#     start_date = _get("start_date")
-#     graduation_date = _get("graduation_date")
-#
-#     parts: List[str] = []
-#
-#     # Degree + major
-#     if degree and major:
-#         parts.append(str(degree))
-#         # Major might already be in degree name; keep it explicit for robustness
-#         parts.append(f"Major: {major}")
-#     elif degree:
-#         parts.append(str(degree))
-#     elif major:
-#         parts.append(f"Major: {major}")
-#
-#     # Institution
-#     if institution:
-#         parts.append(str(institution))
-#
-#     # GPA
-#     if gpa is not None:
-#         parts.append(f"GPA: {gpa}")
-#
-#     # Honors / distinctions
-#     if honors:
-#         parts.append(f"Honors: {honors}")
-#
-#     # Years
-#     start_year = extract_year_from_date(start_date)
-#     end_year = extract_year_from_date(graduation_date)
-#     if start_year or end_year:
-#         if start_year and end_year:
-#             parts.append(f"Years: {start_year}–{end_year}")
-#         elif start_year:
-#             parts.append(f"Years: {start_year}–")
-#         else:
-#             parts.append(f"Years: –{end_year}")
-#
-#     if not parts:
-#         return None
-#
-#     return " | ".join(parts)
-
-#
-# def _collect_education_facts_from_request(request: CVGenerationRequest) -> List[str]:
-#     """Collect education facts from student_profile or legacy profile_info.
-#
-#     This is used to enrich the LLM prompt for the 'education' section.
-#     """
-#     facts: List[str] = []
-#
-#     # Preferred path: student_profile.education
-#     student_profile = getattr(request, "student_profile", None)
-#     if student_profile is not None:
-#         edu_list = getattr(student_profile, "education", None)
-#         if edu_list:
-#             for entry in edu_list:
-#                 fact = _format_education_fact_entry(entry)
-#                 if fact:
-#                     facts.append(fact)
-#
-#     # Legacy / fallback: profile_info["education"]
-#     if not facts:
-#         profile_info = getattr(request, "profile_info", {}) or {}
-#         edu_list = profile_info.get("education")
-#         if edu_list:
-#             for entry in edu_list:
-#                 fact = _format_education_fact_entry(entry)
-#                 if fact:
-#                     facts.append(fact)
-#
-#     return facts
 
 
 @lru_cache(maxsize=1)
@@ -1011,88 +870,6 @@ def _to_serializable(value: Any) -> Any:
         return value
     except TypeError:
         return str(value)
-
-
-# def _collect_evidence_facts_for_section(
-#     evidence_plan: EvidencePlan | None,
-#     section_id: str,
-# ) -> List[str]:
-#     """
-#     Collect evidence facts for a section, *including* any cross-section
-#     sharing rules from CROSS_SECTION_CFG (from parameters.yaml).
-#     """
-#     if evidence_plan is None:
-#         return []
-#
-#     canonical_section_id = _normalize_section_id_for_evidence(section_id)
-#
-#     cross_cfg: Dict[str, Any] = CROSS_SECTION_CFG or {}
-#
-#     # Prefer explicit rule for the actual section_id; fall back to canonical
-#     cfg_key = section_id if section_id in cross_cfg else canonical_section_id
-#     share_from = cross_cfg.get(cfg_key, cross_cfg.get("default", [])) or []
-#
-#     sections_to_pull: set[str] = {canonical_section_id}
-#
-#     # If "all" is present, we will expand to all known sections below
-#     use_all = "all" in share_from
-#     if not use_all:
-#         for src in share_from:
-#             if isinstance(src, str) and src:
-#                 sections_to_pull.add(src)
-#
-#     evidence_facts: List[str] = []
-#     seen_ids: set[str] = set()
-#
-#     # ---------------------------
-#     # Preferred API path
-#     # ---------------------------
-#     if hasattr(evidence_plan, "get_evidence_for_section"):
-#         # If "all" → include every section we know about
-#         if use_all:
-#             hints = getattr(evidence_plan, "section_hints", {}) or {}
-#             for sec in hints.keys():
-#                 sections_to_pull.add(sec)
-#
-#         for sec in sections_to_pull:
-#             for ev in evidence_plan.get_evidence_for_section(sec) or []:
-#                 ev_id = getattr(ev, "evidence_id", None)
-#                 if ev_id and ev_id in seen_ids:
-#                     continue
-#                 if ev_id:
-#                     seen_ids.add(ev_id)
-#                 fact = getattr(ev, "fact", None)
-#                 if fact:
-#                     evidence_facts.append(fact)
-#
-#         return evidence_facts
-#
-#     # ---------------------------
-#     # Fallback: manual wiring via section_hints + evidences
-#     # ---------------------------
-#     hints = getattr(evidence_plan, "section_hints", {}) or {}
-#     evidences = getattr(evidence_plan, "evidences", []) or []
-#
-#     # Start with canonical; hints may already contain it
-#     ids_for_section = set(hints.get(canonical_section_id, []))
-#
-#     if use_all:
-#         for ev in evidences:
-#             ev_id = getattr(ev, "evidence_id", None)
-#             if ev_id:
-#                 ids_for_section.add(ev_id)
-#     else:
-#         for src_section in share_from:
-#             ids_for_section.update(hints.get(src_section, []))
-#
-#     for ev in evidences:
-#         ev_id = getattr(ev, "evidence_id", None)
-#         fact = getattr(ev, "fact", None)
-#         if ev_id in ids_for_section and fact:
-#             evidence_facts.append(fact)
-#
-#     return evidence_facts
-
 
 # ---------------------------------------------------------------------------
 # CV Generation Engine
@@ -2598,27 +2375,7 @@ class CVGenerationEngine:
                 **skills_metrics,
             )
 
-            # Compute matched_jd_skills per section using structured skills + JD info
-            try:
-                jd_target_skills = _extract_jd_target_skills(request)
-            except Exception as exc:
-                logger.warning(
-                    "jd_target_skills_extraction_failed",
-                    error=str(exc),
-                )
-                jd_target_skills = set()
-
-            if jd_target_skills and generated_sections:
-                for section_id, section in generated_sections.items():
-                    matched = compute_section_matched_jd_skills(
-                        section_id=section_id,
-                        section_text=section.text or "",
-                        skills_output=skills_output,
-                        jd_target_skill_names=jd_target_skills,
-                    )
-                    section.matched_jd_skills = matched or []
-
-            return self._build_cv_response(
+            response = self._build_cv_response(
                 request=request,
                 generated_sections=generated_sections,
                 generation_time_ms=elapsed_ms,
@@ -2633,6 +2390,41 @@ class CVGenerationEngine:
                 skills_output=skills_output,
                 justification=justification,
             )
+
+            # 🔹 Post-process: deterministic JD skill matching on all sections
+            try:
+                jd_required_skills = extract_canonical_jd_required_skills(request)
+                logger.info(
+                    "jd_required_skills_extracted",
+                    count=len(jd_required_skills),
+                    skills=jd_required_skills,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "jd_required_skills_extraction_failed",
+                    error=str(exc),
+                )
+                jd_required_skills = []
+
+            if jd_required_skills:
+                try:
+                    response = annotate_matched_jd_skills(
+                        response,
+                        jd_required_skills=jd_required_skills,
+                    )
+                    logger.info(
+                        "jd_required_skills_annotated",
+                        count=len(jd_required_skills),
+                        skills=jd_required_skills,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "annotate_matched_jd_skills_failed",
+                        error=str(exc),
+                    )
+
+            return response
+
 
         finally:
             clear_contextvars()

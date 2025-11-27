@@ -1,3 +1,4 @@
+# tests/test_stage_b_parameters_and_io.py
 """
 Additional Stage B tests_utils focusing on small, IO-free helpers.
 
@@ -22,13 +23,75 @@ import functions.stage_b_generation as stage_b_generation
 from functions.stage_b_generation import (
     _build_taxonomy_only_fallback,
     _summarize_skills_telemetry,
+    CVGenerationEngine,
 )
-from functions.stage_b_generation import CVGenerationEngine
 from functions.utils.experience_functions import render_experience_header
-from .test_stage_b_generation import LoggingTestCase, DummyRequest
 from schemas.input_schema import CVGenerationRequest
 from schemas.internal_schema import SkillsSectionPlan, CanonicalSkill
 from schemas.output_schema import OutputSkillItem
+
+
+class LoggingTestCase(unittest.TestCase):
+    """
+    Minimal logging-aware base test case.
+
+    We keep this simple here to avoid importing test_stage_b_generation,
+    which still depends on legacy internals. If you later want full
+    log-capture behaviour, you can mirror the implementation from that
+    file, but this lightweight stub is sufficient for the current tests.
+    """
+
+    def setUp(self) -> None:  # noqa: D401
+        super().setUp()
+
+    def tearDown(self) -> None:  # noqa: D401
+        super().tearDown()
+
+
+class _DummyTemplateInfo:
+    """Minimal stub for request.template_info used in Stage B tests."""
+
+    def __init__(self) -> None:
+        self.template_id = "T_EMPLOYER_STD_V3"
+        self.sections_order: List[str] = ["profile_summary", "skills", "experience"]
+        self.max_chars_per_section: Dict[str, int] = {}
+
+
+class DummyRequest:
+    """
+    Minimal duck-typed request object to stand in for CVGenerationRequest.
+
+    Only fields actually accessed by Stage B helpers used in these tests
+    are included.
+    """
+
+    def __init__(
+        self,
+        sections: List[str],
+        language: str = "en",
+        profile_info: Optional[Dict[str, Any]] = None,
+        job_id: str = "JOB_TEST",
+        user_id: str = "U-TEST",
+        request_id: str = "REQ-TEST",
+    ) -> None:
+        self.sections = sections
+        self.language = language
+        self.profile_info: Dict[str, Any] = profile_info or {}
+        self.student_profile: Any = None
+
+        # Job / template metadata for logging and prompt-building
+        self.job_id = job_id
+        self.user_id = user_id
+        self.request_id = request_id
+
+        self.template_info = _DummyTemplateInfo()
+
+        # Legacy field used by Stage B when user provided section text
+        self.user_input_cv_text_by_section: Dict[str, str] = {}
+
+        # Optional job info fields; kept simple here
+        self.job_role_info: Optional[Dict[str, Any]] = None
+        self.job_position_info: Optional[Dict[str, Any]] = None
 
 
 # ----------------------------------------------------------------------
@@ -40,6 +103,7 @@ class ExperienceItem:
 
     Only fields actually accessed by Stage B / tests_utils are included.
     """
+
     title: Optional[str]
     company: Optional[str]
     start_date: Optional[str]
@@ -127,7 +191,11 @@ class TestTaxonomyOnlyFallbackMinimal(unittest.TestCase):
         sp = SkillsSectionPlan(
             canonical_skills=[
                 CanonicalSkill(name="Python", level="L3_Advanced", taxonomy_id=None),
-                CanonicalSkill(name="Machine Learning", level="L2_Intermediate", taxonomy_id=None),
+                CanonicalSkill(
+                    name="Machine Learning",
+                    level="L2_Intermediate",
+                    taxonomy_id=None,
+                ),
             ],
             allowed_additional_skills=[],
         )
