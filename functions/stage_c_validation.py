@@ -74,6 +74,11 @@ def _load_validation_params() -> Dict[str, Any]:
     if isinstance(trunc_cfg, dict):
         cfg.setdefault("_truncation_cfg", trunc_cfg)
 
+    # Attach markdown cleanup config
+    markdown_cfg = params.get("markdown_cleanup") or {}
+    if isinstance(markdown_cfg, dict):
+        cfg.setdefault("_markdown_cfg", markdown_cfg)
+
     return cfg
 
 def _fallback_skills_from_request(original_request: Any) -> List[OutputSkillItem]:
@@ -499,14 +504,22 @@ def _matches_any_pattern(text: str, patterns: Iterable[str]) -> bool:
     return False
 
 
-def _strip_leading_markdown_headers(text: str) -> str:
+def _strip_leading_markdown_headers(
+    section_id: str,
+    text: str,
+    cfg: Dict[str, Any],
+) -> str:
     """
-    Remove leading markdown headings like '#', '##', '###' and pure bold
-    heading lines such as '**References**' or '**บุคคลอ้างอิง**' that
-    the LLM sometimes adds at the very top of a section.
+    Remove leading markdown headings like '#', '##', '###', bold headers,
+    and plain-text section headers configured in parameters.yaml.
     """
     if not text:
         return text
+
+    markdown_cfg = cfg.get("_markdown_cfg") or {}
+    section_headers_cfg = markdown_cfg.get("section_headers") or {}
+    raw_headers = section_headers_cfg.get(section_id, []) or []
+    section_headers = {h.lower().strip("* ").strip() for h in raw_headers}
 
     lines = text.splitlines()
     idx = 0
@@ -514,6 +527,7 @@ def _strip_leading_markdown_headers(text: str) -> str:
     while idx < len(lines):
         line = lines[idx].strip()
         if not line:
+            # skip blank lines
             idx += 1
             continue
 
@@ -524,6 +538,11 @@ def _strip_leading_markdown_headers(text: str) -> str:
 
         # Pure bold heading line: '**something**'
         if line.startswith("**") and line.endswith("**") and len(line) > 4:
+            idx += 1
+            continue
+
+        # Config-driven plain headers (Education, EDUCATION, 学歴, …)
+        if line.lower().strip("* ").strip() in section_headers:
             idx += 1
             continue
 
@@ -551,7 +570,11 @@ def _strip_markdown_bullet_prefixes(text: str) -> str:
     return "\n".join(cleaned_lines).strip()
 
 
-def _clean_section_markdown(section_id: str, text: str) -> str:
+def _clean_section_markdown(
+    section_id: str,
+    text: str,
+    cfg: Dict[str, Any],
+) -> str:
     """
     Apply markdown cleanup rules per section.
 
@@ -562,14 +585,18 @@ def _clean_section_markdown(section_id: str, text: str) -> str:
     if not text:
         return text
 
-    text = _strip_leading_markdown_headers(text)
+    text = _strip_leading_markdown_headers(section_id, text, cfg)
+
+    markdown_cfg = cfg.get("_markdown_cfg") or {}
+    bullet_sections = set(markdown_cfg.get("bullet_list_sections") or [])
 
     # These sections are rendered as bullet lists by the template;
     # we don't want extra '* ' / '- ' from the LLM.
-    if section_id in {"publications", "training", "references", "additional_info"}:
+    if section_id in bullet_sections:
         text = _strip_markdown_bullet_prefixes(text)
 
     return text
+
 
 def _clean_sections_no_truncate(
     *,
@@ -648,7 +675,7 @@ def _clean_sections_no_truncate(
                 logger.warning("stage_c_section_suspicious", section_id=section_id)
 
         # Normalize markdown artifacts (headings, extra bullets)
-        text = _clean_section_markdown(section_id, text)
+        text = _clean_section_markdown(section_id, text, cfg)
 
         # Basic cleaning
         text = _clean_text(text, enable_cleaning)

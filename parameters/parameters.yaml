@@ -167,6 +167,47 @@ security:
   control_chars_except_whitespace: "[\\x00-\\x08\\x0B-\\x0C\\x0E-\\x1F\\x7F]"
 
 # -----------------------------------------------------------------------------
+# Output cleanup
+# -----------------------------------------------------------------------------
+markdown_cleanup:
+  # Section-specific headings that should be stripped
+  section_headers:
+    education:
+      - "Education"
+      - "Educations"
+      - "ประวัติการศึกษา"
+      - "การศึกษา"
+    experience:
+      - "Experience"
+      - "Work Experience"
+      - "Professional Experience"
+      - "ประวัติการทำงาน"
+      - "ประสบการณ์ทำงาน"
+    publications:
+      - "Publications"
+      - "Selected Publications"
+      - "ผลงานตีพิมพ์"
+    training:
+      - "Training"
+      - "Courses"
+      - "Certifications"
+      - "การฝึกอบรม"
+    references:
+      - "References"
+      - "Referees"
+      - "บุคคลอ้างอิง"
+    additional_info:
+      - "Additional Information"
+      - "Additional Info"
+
+  # Sections where the Jinja template already renders bullets
+  bullet_list_sections:
+    - "publications"
+    - "training"
+    - "references"
+    - "additional_info"
+
+# -----------------------------------------------------------------------------
 # Truncation configuration
 # -----------------------------------------------------------------------------
 truncation_config:

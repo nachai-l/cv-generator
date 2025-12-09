@@ -1134,5 +1134,137 @@ class TestJustificationOrder(LoggingTestCase):
         # And obviously shorter than the original
         self.assertLess(len(final_text), len(long_text))
 
+
+# ---------------------------------------------------------------------------
+# Tests for markdown cleanup (section headers & bullet handling)
+# ---------------------------------------------------------------------------
+
+
+class TestMarkdownCleanup(LoggingTestCase):
+    """Tests for section-specific markdown cleanup driven by parameters.yaml."""
+
+    def _fake_cfg(self) -> Dict[str, Any]:
+        """
+        Validation + truncation + markdown_cleanup config, mirroring parameters.yaml
+        structure used in Stage C.
+        """
+        return {
+            "validation": {
+                "max_section_chars_default": 1000,
+                "drop_empty_sections": True,
+                "enable_safety_cleaning": True,
+                "max_skills": 10,
+                "strict_mode": False,
+            },
+            "truncation_config": {
+                "truncation_enable": True,
+                "overflow_limit": 64,
+                "reduction_limit": 0.15,
+            },
+            "markdown_cleanup": {
+                "section_headers": {
+                    # include a few aliases / languages for robustness
+                    "education": [
+                        "Education",
+                        "EDUCATION",
+                        "学歴",
+                    ],
+                    "publications": [
+                        "Publications",
+                        "ผลงานตีพิมพ์",
+                    ],
+                },
+                "bullet_list_sections": [
+                    "publications",
+                ],
+            },
+        }
+
+    def test_configured_section_header_is_stripped_for_education(self) -> None:
+        """
+        The first line that matches markdown_cleanup.section_headers[section_id]
+        must be removed from the section body, regardless of case.
+        """
+        meta = DummyMeta()
+
+        # "Education" header should be stripped, leaving only the degree lines
+        text = "EDUCATION\n\nPhD in X\nBSc in Y"
+        resp = CVGenerationResponse.model_construct(
+            template_id="T_TEST",
+            job_id="JOB1",
+            language="en",
+            sections={
+                "education": SectionContent.model_construct(text=text),
+            },
+            metadata=meta,
+            skills=None,
+        )
+
+        template_info: Dict[str, Any] = {
+            "sections_order": ["education"],
+            "max_chars_per_section": {"education": 500},
+        }
+
+        with patch("functions.stage_c_validation.load_parameters", lambda: self._fake_cfg()):
+            validated = run_stage_c_validation(
+                resp,
+                template_info=template_info,
+                original_request=None,
+            )
+
+        out_text = validated.sections["education"].text
+        lines = [ln for ln in out_text.splitlines() if ln.strip()]
+
+        # First non-empty line should be the PhD, not "Education"
+        self.assertTrue(lines[0].startswith("PhD in"))
+        self.assertNotIn("Education", lines[0])
+        self.assertNotIn("EDUCATION", out_text)
+
+    def test_bullet_prefixes_stripped_for_bullet_list_sections(self) -> None:
+        """
+        Sections declared in markdown_cleanup.bullet_list_sections should have
+        markdown bullet prefixes (* / -) stripped so the Jinja template can
+        render bullets cleanly.
+        """
+        meta = DummyMeta()
+
+        raw_text = "* Publication 1\n- Publication 2\n• Publication 3"
+        resp = CVGenerationResponse.model_construct(
+            template_id="T_TEST",
+            job_id="JOB1",
+            language="en",
+            sections={
+                "publications": SectionContent.model_construct(text=raw_text),
+            },
+            metadata=meta,
+            skills=None,
+        )
+
+        template_info: Dict[str, Any] = {
+            "sections_order": ["publications"],
+            "max_chars_per_section": {"publications": 500},
+        }
+
+        with patch("functions.stage_c_validation.load_parameters", lambda: self._fake_cfg()):
+            validated = run_stage_c_validation(
+                resp,
+                template_info=template_info,
+                original_request=None,
+            )
+
+        out_text = validated.sections["publications"].text
+        lines = [ln for ln in out_text.splitlines() if ln.strip()]
+
+        # No line should start with a markdown bullet marker now
+        for ln in lines:
+            self.assertFalse(ln.lstrip().startswith("* "))
+            self.assertFalse(ln.lstrip().startswith("- "))
+
+        # Content should still be present (no accidental dropping)
+        joined = " ".join(lines)
+        self.assertIn("Publication 1", joined)
+        self.assertIn("Publication 2", joined)
+
+
 if __name__ == "__main__":
     unittest.main()
